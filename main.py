@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 # APP VERSION & GITHUB REPOSITORY CONFIG
 # ==========================================
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_OWNER = "giogosgame8"
 GITHUB_REPO = "NebulaModManager"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -206,11 +206,42 @@ def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> st
 # ==========================================
 # AUTOMATIC GITHUB UPDATE CHECKER & INSTALLER
 # ==========================================
+INSTALLED_VERSION_FILE = APP_DATA_DIR / "installed_version.txt"
+
+
 class AppAutoUpdater:
     @staticmethod
     def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
+        """Extracts semantic version numbers (e.g. 'v1.0.1' -> (1, 0, 1))."""
+        match = re.search(r"(\d+(?:\.\d+)+)", ver_str)
+        if match:
+            return tuple(int(n) for n in match.group(1).split("."))
         nums = [int(n) for n in re.findall(r"\d+", ver_str)]
-        return tuple(nums) if nums else (0, 0, 0)
+        return tuple(nums[:3]) if nums else (0, 0, 0)
+
+    @classmethod
+    def get_current_effective_version(cls) -> tuple[str, tuple[int, ...]]:
+        """
+        Returns the highest version between APP_VERSION in code and the last
+        auto-installed GitHub tag stored in AppData (prevents infinite update loops).
+        """
+        code_tuple = cls._parse_version_tuple(APP_VERSION)
+        if INSTALLED_VERSION_FILE.exists():
+            try:
+                saved_tag = INSTALLED_VERSION_FILE.read_text(encoding="utf-8").strip()
+                saved_tuple = cls._parse_version_tuple(saved_tag)
+                if saved_tuple >= code_tuple:
+                    return saved_tag, saved_tuple
+            except Exception:
+                pass
+        return APP_VERSION, code_tuple
+
+    @classmethod
+    def record_installed_version(cls, tag_name: str):
+        try:
+            INSTALLED_VERSION_FILE.write_text(tag_name.strip(), encoding="utf-8")
+        except Exception:
+            pass
 
     @classmethod
     def check_for_updates(cls) -> dict | None:
@@ -228,10 +259,11 @@ class AppAutoUpdater:
             if not tag_name:
                 return None
 
+            current_tag, local_ver = cls.get_current_effective_version()
             remote_ver = cls._parse_version_tuple(tag_name)
-            local_ver = cls._parse_version_tuple(APP_VERSION)
 
-            if remote_ver <= local_ver:
+            # Already on this exact tag or a newer/equal version -> Do NOT prompt!
+            if tag_name.lower() == current_tag.lower() or remote_ver <= local_ver:
                 return None
 
             setup_download_url = None
@@ -258,6 +290,7 @@ class AppAutoUpdater:
     def download_and_apply_update(cls, update_info: dict, progress_callback) -> tuple[bool, str]:
         setup_url = update_info.get("setup_download_url")
         asset_name = update_info.get("asset_name", "NebulaModManager_Setup.exe")
+        tag_name = update_info.get("tag_name", APP_VERSION)
         headers = {"User-Agent": f"NebulaModManager/{APP_VERSION}"}
 
         if setup_url:
@@ -284,8 +317,16 @@ class AppAutoUpdater:
                                     mb_d = downloaded / (1024 * 1024)
                                     progress_callback(0.5, f"Downloading update: {mb_d:.1f} MB...")
 
-                progress_callback(1.0, "Launching automatic installer...")
-                subprocess.Popen([str(temp_setup_path), "/SILENT", "/CLOSEAPPLICATIONS"])
+                progress_callback(1.0, "Launching installer...")
+                # Record the new tag immediately so it never loops even if APP_VERSION wasn't bumped
+                cls.record_installed_version(tag_name)
+
+                # Launch the installer in a detached process so closing Nebula doesn't kill or crash it
+                subprocess.Popen(
+                    f'cmd /c timeout /t 1 /nobreak >nul & start "" "{temp_setup_path}" /SILENT',
+                    shell=True,
+                    creationflags=0x08000000
+                )
                 return True, "installer_launched"
             except Exception as e:
                 return False, f"Failed to download installer update: {str(e)}"
@@ -297,12 +338,14 @@ class AppAutoUpdater:
                 if resp.status_code == 200 and "NebulaModManagerApp" in resp.text:
                     current_file = Path(__file__).resolve()
                     current_file.write_text(resp.text, encoding="utf-8")
+                    cls.record_installed_version(tag_name)
                     progress_callback(1.0, "Restarting Nebula Mod Manager...")
                     subprocess.Popen([sys.executable, str(current_file)])
                     return True, "source_restarted"
             except Exception as e:
                 return False, f"Failed to update source code: {str(e)}"
 
+        cls.record_installed_version(tag_name)
         webbrowser.open(update_info.get("html_url", f"{GITHUB_REPO_URL}/releases/latest"))
         return False, "Opened GitHub Release page in your browser to download the update."
 
@@ -402,30 +445,35 @@ class UpdatePromptDialog(ctk.CTkToplevel):
         self.status_lbl.pack(padx=22, anchor="w")
 
         def progress_cb(pct: float, text: str):
-            self.after(0, lambda: self._update_progress_ui(pct, text))
+            if self.winfo_exists():
+                self.after(0, lambda: self._update_progress_ui(pct, text))
 
         def worker():
             ok, msg = AppAutoUpdater.download_and_apply_update(self.update_info, progress_cb)
-            self.after(0, lambda: self._on_update_finished(ok, msg))
+            if self.winfo_exists():
+                self.after(0, lambda: self._on_update_finished(ok, msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _update_progress_ui(self, pct: float, text: str):
-        self.progress_bar.set(max(0.0, min(1.0, pct)))
-        self.status_lbl.configure(text=text)
+        if self.winfo_exists():
+            self.progress_bar.set(max(0.0, min(1.0, pct)))
+            self.status_lbl.configure(text=text)
 
     def _on_update_finished(self, ok: bool, msg: str):
         if ok:
-            self.grab_release()
-            self.parent_app.destroy()
-            sys.exit(0)
+            # Exit process cleanly with os._exit(0) so PyInstaller never throws a SystemExit crash popup
+            os._exit(0)
         else:
             messagebox.showinfo("Update Info", msg)
             self._close_dialog()
 
     def _close_dialog(self):
-        self.grab_release()
-        self.destroy()
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ==========================================
