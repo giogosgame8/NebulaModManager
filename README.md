@@ -64,7 +64,7 @@ If you prefer to inspect the code and run or compile Nebula Mod Manager yourself
 
 ### 2. Clone & Run Locally
 ```bash
-git clone [https://github.com/cornitel/NebulaModManager.git](https://github.com/cornitel/NebulaModManager.git)
+git clone [https://github.com/giogosgame8/NebulaModManager.git](https://github.com/cornitel/NebulaModManager.git)
 cd NebulaModManager
 python -m pip install -r requirements.txt
 python main.py

@@ -2,16 +2,16 @@ import os
 import re
 import sys
 import json
-import html
 import ctypes
 import shutil
 import zipfile
+import tempfile
 import threading
 import subprocess
 import webbrowser
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -27,11 +27,14 @@ except ImportError:
     DND_AVAILABLE = False
 
 # ==========================================
-# GITHUB OPEN-SOURCE REPOSITORY URL
+# APP VERSION & GITHUB REPOSITORY CONFIG
 # ==========================================
-# Replace with your actual GitHub repository URL after pushing your project:
-GITHUB_REPO_URL = "https://github.com/cornitel/NebulaModManager"
-GITHUB_ISSUES_URL = f"{GITHUB_REPO_URL}/issues/new?template=bug_report.md"
+APP_VERSION = "1.0.0"
+GITHUB_OWNER = "giogosgame8"
+GITHUB_REPO = "NebulaModManager"
+GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+GITHUB_API_LATEST_RELEASE = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_RAW_MAIN_PY = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/main/main.py"
 
 # ==========================================
 # WINDOWS TASKBAR APP ID REGISTRATION
@@ -39,7 +42,7 @@ GITHUB_ISSUES_URL = f"{GITHUB_REPO_URL}/issues/new?template=bug_report.md"
 if sys.platform == "win32":
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "NebulaMods.SteamModManager.3.0"
+            f"NebulaMods.SteamModManager.{APP_VERSION}"
         )
     except Exception:
         pass
@@ -83,7 +86,9 @@ ROTTR_ARCHIVES_DIR = APP_DATA_DIR / "rottr_archives"
 MANIFEST_FILE = APP_DATA_DIR / "installed_mods.json"
 LOADER_MANIFEST_FILE = APP_DATA_DIR / "installed_loaders.json"
 CUSTOM_PATHS_FILE = APP_DATA_DIR / "custom_mod_paths_v2.json"
-ONLINE_CACHE_FILE = CACHE_DIR / "online_game_metadata_v6.json"
+ONLINE_CACHE_FILE = CACHE_DIR / "online_game_metadata_v7.json"
+VERIFIED_SITES_CACHE_FILE = CACHE_DIR / "verified_mod_sites_v2.json"
+NEXUS_GAMES_CACHE_FILE = CACHE_DIR / "nexus_games_list.json"
 ICON_PATH = APP_DATA_DIR / "nebula_icon.ico"
 
 for folder in (APP_DATA_DIR, CACHE_DIR, DISABLED_MODS_DIR, VANILLA_BACKUP_DIR, ROTTR_ARCHIVES_DIR):
@@ -154,10 +159,283 @@ def ensure_app_icon() -> Path:
     return ICON_PATH
 
 
+def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> str:
+    """
+    Converts messy archive names (like 'No_Mercy_Menu-4299-1-0-1712345678' or 'a4-s4-b8-1-8')
+    into clean, human-readable mod titles, checking internal mod metadata files first.
+    """
+    # 1. Check if the archive contains a manifest.json / info.json with a clean title
+    if staging_dir and staging_dir.exists():
+        for meta_file in ("manifest.json", "info.json", "mod.json"):
+            for found in staging_dir.rglob(meta_file):
+                try:
+                    data = json.loads(found.read_text(encoding="utf-8-sig", errors="ignore"))
+                    candidate = data.get("title") or data.get("name") or data.get("Name")
+                    if isinstance(candidate, str) and 2 <= len(candidate.strip()) <= 60:
+                        return candidate.strip().replace("_", " ")
+                except Exception:
+                    pass
+
+        # If the archive has a single top-level descriptive folder, prefer its name if raw_name looks cryptic
+        top_dirs = [d for d in staging_dir.iterdir() if d.is_dir()]
+        if len(top_dirs) == 1:
+            folder_name = top_dirs[0].name
+            if folder_name.lower() not in {
+                "readyornot", "content", "paks", "movies", "fmod", "logicmods",
+                "bepinex", "plugins", "mods", "data", "scripts", "ue4ss", "vehicles", "levels"
+            }:
+                if len(folder_name) > 3 and not re.search(r"-\d{8,}$", folder_name):
+                    raw_name = folder_name
+
+    name = Path(raw_name).stem if raw_name.lower().endswith((".zip", ".rar", ".7z")) else raw_name
+
+    # 2. Strip Nexus Mods trailing pattern: -<ModID>-<Version...>-<UnixTimestamp>
+    name = re.sub(r"-\d+\s*(?:-[0-9a-zA-Z_.]+\s*)+-\d{9,11}$", "", name)
+    # Strip trailing Nexus ModID + version if ends with -<4+ digits>-<version>
+    name = re.sub(r"-\d{3,7}-\d+(?:-\d+)+$", "", name)
+    # Strip common trailing version tags like _v1.2.3 or -v1.0
+    name = re.sub(r"[\s_\-]+[vV]?\d+\.\d+(?:\.\d+)*$", "", name)
+
+    # 3. Replace underscores and dashes with spaces
+    name = name.replace("_", " ").replace("-", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name if name else raw_name
+
+
 # ==========================================
-# KNOWN NEXUS MODS SLUGS FOR DIRECT LINKS
+# AUTOMATIC GITHUB UPDATE CHECKER & INSTALLER
 # ==========================================
-NEXUS_GAME_SLUGS = {
+class AppAutoUpdater:
+    @staticmethod
+    def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
+        nums = [int(n) for n in re.findall(r"\d+", ver_str)]
+        return tuple(nums) if nums else (0, 0, 0)
+
+    @classmethod
+    def check_for_updates(cls) -> dict | None:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"NebulaModManager/{APP_VERSION}"
+        }
+        try:
+            resp = requests.get(GITHUB_API_LATEST_RELEASE, headers=headers, timeout=6)
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            tag_name = str(data.get("tag_name", "")).strip()
+            if not tag_name:
+                return None
+
+            remote_ver = cls._parse_version_tuple(tag_name)
+            local_ver = cls._parse_version_tuple(APP_VERSION)
+
+            if remote_ver <= local_ver:
+                return None
+
+            setup_download_url = None
+            asset_name = "NebulaModManager_Setup.exe"
+            for asset in data.get("assets", []):
+                name = str(asset.get("name", ""))
+                if name.lower().endswith(".exe"):
+                    setup_download_url = asset.get("browser_download_url")
+                    asset_name = name
+                    break
+
+            return {
+                "tag_name": tag_name,
+                "release_name": data.get("name") or tag_name,
+                "body": data.get("body") or "Bug fixes and game compatibility improvements.",
+                "html_url": data.get("html_url") or f"{GITHUB_REPO_URL}/releases/latest",
+                "setup_download_url": setup_download_url,
+                "asset_name": asset_name
+            }
+        except Exception:
+            return None
+
+    @classmethod
+    def download_and_apply_update(cls, update_info: dict, progress_callback) -> tuple[bool, str]:
+        setup_url = update_info.get("setup_download_url")
+        asset_name = update_info.get("asset_name", "NebulaModManager_Setup.exe")
+        headers = {"User-Agent": f"NebulaModManager/{APP_VERSION}"}
+
+        if setup_url:
+            try:
+                temp_setup_path = Path(tempfile.gettempdir()) / asset_name
+                with requests.get(setup_url, stream=True, headers=headers, timeout=45) as r:
+                    r.raise_for_status()
+                    total_bytes = int(r.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(temp_setup_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_bytes > 0:
+                                    pct = downloaded / total_bytes
+                                    mb_d = downloaded / (1024 * 1024)
+                                    mb_t = total_bytes / (1024 * 1024)
+                                    progress_callback(
+                                        pct,
+                                        f"Downloading update: {mb_d:.1f} / {mb_t:.1f} MB ({int(pct * 100)}%)"
+                                    )
+                                else:
+                                    mb_d = downloaded / (1024 * 1024)
+                                    progress_callback(0.5, f"Downloading update: {mb_d:.1f} MB...")
+
+                progress_callback(1.0, "Launching automatic installer...")
+                subprocess.Popen([str(temp_setup_path), "/SILENT", "/CLOSEAPPLICATIONS"])
+                return True, "installer_launched"
+            except Exception as e:
+                return False, f"Failed to download installer update: {str(e)}"
+
+        if not getattr(sys, "frozen", False):
+            try:
+                progress_callback(0.4, "Fetching latest main.py from GitHub...")
+                resp = requests.get(GITHUB_RAW_MAIN_PY, headers=headers, timeout=15)
+                if resp.status_code == 200 and "NebulaModManagerApp" in resp.text:
+                    current_file = Path(__file__).resolve()
+                    current_file.write_text(resp.text, encoding="utf-8")
+                    progress_callback(1.0, "Restarting Nebula Mod Manager...")
+                    subprocess.Popen([sys.executable, str(current_file)])
+                    return True, "source_restarted"
+            except Exception as e:
+                return False, f"Failed to update source code: {str(e)}"
+
+        webbrowser.open(update_info.get("html_url", f"{GITHUB_REPO_URL}/releases/latest"))
+        return False, "Opened GitHub Release page in your browser to download the update."
+
+
+class UpdatePromptDialog(ctk.CTkToplevel):
+    def __init__(self, parent, update_info: dict):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.update_info = update_info
+        tag = update_info.get("tag_name", "New Version")
+
+        self.title("Update Available — Nebula Mod Manager")
+        self.geometry("520x270")
+        self.resizable(False, False)
+        self.configure(fg_color=THEME["bg_root"])
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width() // 2) - 260
+        py = parent.winfo_rooty() + (parent.winfo_height() // 2) - 135
+        self.geometry(f"+{max(px, 50)}+{max(py, 50)}")
+
+        card = ctk.CTkFrame(
+            self,
+            fg_color=THEME["bg_card"],
+            border_color=THEME["accent"],
+            border_width=2,
+            corner_radius=16
+        )
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(
+            card,
+            text="🚀  Update Available",
+            font=ctk.CTkFont(size=20, weight="bold"),
+            text_color=THEME["text_main"]
+        ).pack(padx=22, pady=(20, 8), anchor="w")
+
+        self.msg_lbl = ctk.CTkLabel(
+            card,
+            text=f"An available update was found ({tag}), Would you like to update?",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color=THEME["text_muted"],
+            justify="left",
+            wraplength=460
+        )
+        self.msg_lbl.pack(padx=22, pady=(0, 14), anchor="w")
+
+        self.progress_bar = ctk.CTkProgressBar(
+            card,
+            mode="determinate",
+            progress_color=THEME["play_bg"],
+            fg_color=THEME["bg_root"],
+            height=10
+        )
+        self.progress_bar.set(0.0)
+
+        self.status_lbl = ctk.CTkLabel(
+            card,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_success"]
+        )
+
+        self.btn_row = ctk.CTkFrame(card, fg_color="transparent")
+        self.btn_row.pack(fill="x", padx=22, pady=(12, 16), side="bottom")
+
+        self.update_btn = ctk.CTkButton(
+            self.btn_row,
+            text="⚡ Update",
+            fg_color=THEME["play_bg"],
+            hover_color=THEME["play_hover"],
+            font=ctk.CTkFont(size=14, weight="bold"),
+            width=160,
+            height=38,
+            command=self._start_auto_update
+        )
+        self.update_btn.pack(side="left", padx=(0, 12))
+
+        self.skip_btn = ctk.CTkButton(
+            self.btn_row,
+            text="Let me use it",
+            fg_color=THEME["disabled_bg"],
+            hover_color=THEME["disabled_hover"],
+            font=ctk.CTkFont(size=13, weight="bold"),
+            width=150,
+            height=38,
+            command=self._close_dialog
+        )
+        self.skip_btn.pack(side="left")
+
+    def _start_auto_update(self):
+        self.update_btn.configure(text="⏳ Updating...", state="disabled")
+        self.skip_btn.configure(state="disabled")
+        self.progress_bar.pack(fill="x", padx=22, pady=(0, 6))
+        self.status_lbl.pack(padx=22, anchor="w")
+
+        def progress_cb(pct: float, text: str):
+            self.after(0, lambda: self._update_progress_ui(pct, text))
+
+        def worker():
+            ok, msg = AppAutoUpdater.download_and_apply_update(self.update_info, progress_cb)
+            self.after(0, lambda: self._on_update_finished(ok, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_progress_ui(self, pct: float, text: str):
+        self.progress_bar.set(max(0.0, min(1.0, pct)))
+        self.status_lbl.configure(text=text)
+
+    def _on_update_finished(self, ok: bool, msg: str):
+        if ok:
+            self.grab_release()
+            self.parent_app.destroy()
+            sys.exit(0)
+        else:
+            messagebox.showinfo("Update Info", msg)
+            self._close_dialog()
+
+    def _close_dialog(self):
+        self.grab_release()
+        self.destroy()
+
+
+# ==========================================
+# PER-GAME MOD SITE VERIFIER (NEXUS, THUNDERSTORE, MOD.IO, CURSEFORGE)
+# ==========================================
+NEXUS_FALLBACK_SLUGS = {
+    "70": "halflife",
+    "220": "halflife2",
+    "550": "left4dead2",
+    "4000": "garrysmod",
     "1144200": "readyornot",
     "391220": "riseofthetombraider",
     "750920": "shadowofthetombraider",
@@ -186,6 +464,252 @@ NEXUS_GAME_SLUGS = {
     "1643320": "stalker2heartofchornobyl",
 }
 
+MODIO_KNOWN_SLUGS = {
+    "1144200": "readyornot",
+    "2167580": "bonelab",
+    "823500": "boneworks",
+    "1086940": "baldursgate3",
+    "1643320": "stalker2",
+    "548430": "drg",
+    "581320": "insurgencysandstorm",
+    "1465360": "snowrunner",
+    "555160": "pavlov",
+    "629760": "mordhau",
+    "1167630": "teardown",
+}
+
+
+class ModSiteVerifier:
+    """
+    Checks each modding site (Nexus Mods, Thunderstore, Mod.io, CurseForge) for the selected game:
+      1. Resolves the exact game-specific URL so links never land on a generic homepage.
+      2. Verifies whether the game actually exists and has mods on that site.
+      3. Caches verified sites per AppID for instant loading.
+    """
+    _nexus_domain_map = None
+    _thunderstore_comm_map = None
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", text.lower())
+
+    @classmethod
+    def _load_sites_cache(cls) -> dict:
+        if VERIFIED_SITES_CACHE_FILE.exists():
+            try:
+                return json.loads(VERIFIED_SITES_CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    @classmethod
+    def _save_sites_cache(cls, data: dict):
+        try:
+            VERIFIED_SITES_CACHE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    @classmethod
+    def _ensure_nexus_games_map(cls) -> dict:
+        """Loads Nexus Mods' official games.json (name -> domain_name for games with mods > 0)."""
+        if cls._nexus_domain_map is not None:
+            return cls._nexus_domain_map
+
+        cls._nexus_domain_map = {}
+        raw_list = None
+
+        if NEXUS_GAMES_CACHE_FILE.exists():
+            try:
+                # Refresh cache if older than 7 days
+                age_days = (datetime.now().timestamp() - NEXUS_GAMES_CACHE_FILE.stat().st_mtime) / 86400
+                if age_days < 7:
+                    raw_list = json.loads(NEXUS_GAMES_CACHE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                raw_list = None
+
+        if raw_list is None:
+            try:
+                headers = {"User-Agent": f"NebulaModManager/{APP_VERSION}"}
+                resp = requests.get(
+                    "https://data.nexusmods.com/file/nexus-data/games.json",
+                    headers=headers,
+                    timeout=6
+                )
+                if resp.status_code == 200:
+                    raw_list = resp.json()
+                    NEXUS_GAMES_CACHE_FILE.write_text(json.dumps(raw_list), encoding="utf-8")
+            except Exception:
+                raw_list = []
+
+        for entry in raw_list or []:
+            domain = entry.get("domain_name")
+            name = entry.get("name", "")
+            mods_count = entry.get("mods", 0)
+            if domain and name and mods_count and int(mods_count) > 0:
+                cls._nexus_domain_map[cls._norm(name)] = (domain, int(mods_count))
+
+        return cls._nexus_domain_map
+
+    @classmethod
+    def _ensure_thunderstore_map(cls) -> dict:
+        """Loads Thunderstore's official community list (normalized_name -> identifier)."""
+        if cls._thunderstore_comm_map is not None:
+            return cls._thunderstore_comm_map
+
+        cls._thunderstore_comm_map = {}
+        try:
+            headers = {"User-Agent": f"NebulaModManager/{APP_VERSION}"}
+            resp = requests.get(
+                "https://thunderstore.io/api/experimental/community/",
+                headers=headers,
+                timeout=5
+            ).json()
+            for c in resp.get("results", []):
+                cname = c.get("name", "")
+                cid = c.get("identifier", "")
+                if cname and cid:
+                    cls._thunderstore_comm_map[cls._norm(cname)] = cid
+        except Exception:
+            pass
+        return cls._thunderstore_comm_map
+
+    @classmethod
+    def verify_sites_for_game(cls, game: dict) -> list[dict]:
+        """Returns ONLY the mod sites that have a verified page and active mods for `game`."""
+        appid = str(game["appid"])
+        game_name = game["name"]
+
+        cache = cls._load_sites_cache()
+        if appid in cache:
+            return cache[appid]
+
+        verified_sites = []
+        norm_title = cls._norm(game_name)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        }
+
+        # ------------------------------------------------------------------
+        # 1. NEXUS MODS (Exact domain_name resolution + verification)
+        # ------------------------------------------------------------------
+        nexus_map = cls._ensure_nexus_games_map()
+        nexus_domain = None
+        nexus_mod_count = None
+
+        if appid in NEXUS_FALLBACK_SLUGS:
+            nexus_domain = NEXUS_FALLBACK_SLUGS[appid]
+            if norm_title in nexus_map:
+                nexus_mod_count = nexus_map[norm_title][1]
+        elif norm_title in nexus_map:
+            nexus_domain, nexus_mod_count = nexus_map[norm_title]
+        else:
+            # Try stripping editions (e.g., "Game: Special Edition" -> "Game")
+            base_title = cls._norm(re.split(r"[:\-–—]", game_name)[0])
+            if base_title and base_title in nexus_map:
+                nexus_domain, nexus_mod_count = nexus_map[base_title]
+            else:
+                # Probe direct domain slug on nexusmods.com
+                try:
+                    probe_url = f"https://www.nexusmods.com/{norm_title}/mods/"
+                    r = requests.get(probe_url, headers=headers, timeout=4, allow_redirects=True)
+                    if r.status_code == 200 and f"nexusmods.com/{norm_title}" in r.url.lower():
+                        nexus_domain = norm_title
+                except Exception:
+                    pass
+
+        if nexus_domain:
+            count_tag = f" ({nexus_mod_count:,} mods available)" if nexus_mod_count else ""
+            verified_sites.append({
+                "icon": "🔶",
+                "name": "Nexus Mods",
+                "desc": f"Official {game_name} Nexus Mods hub{count_tag}",
+                "url": f"https://www.nexusmods.com/{nexus_domain}/mods/"
+            })
+
+        # ------------------------------------------------------------------
+        # 2. THUNDERSTORE (Only shown if game has a verified Thunderstore community)
+        # ------------------------------------------------------------------
+        ts_map = cls._ensure_thunderstore_map()
+        ts_slug = ts_map.get(norm_title)
+        if not ts_slug:
+            hyphen_slug = re.sub(r"[^a-z0-9]+", "-", game_name.lower()).strip("-")
+            for k, v in ts_map.items():
+                if v == hyphen_slug:
+                    ts_slug = v
+                    break
+
+        if ts_slug:
+            verified_sites.append({
+                "icon": "⚡",
+                "name": "Thunderstore",
+                "desc": f"Verified {game_name} community mod packages on Thunderstore",
+                "url": f"https://thunderstore.io/c/{ts_slug}/"
+            })
+
+        # ------------------------------------------------------------------
+        # 3. MOD.IO (Only shown if the game actually exists on Mod.io!)
+        # ------------------------------------------------------------------
+        modio_slug = MODIO_KNOWN_SLUGS.get(appid)
+        if not modio_slug:
+            # Probe Mod.io to see if a real game hub exists for this title
+            hyphen_candidate = re.sub(r"[^a-z0-9]+", "-", game_name.lower()).strip("-")
+            for candidate in dict.fromkeys([norm_title, hyphen_candidate]):
+                if not candidate:
+                    continue
+                try:
+                    probe_url = f"https://mod.io/g/{candidate}"
+                    r = requests.get(probe_url, headers=headers, timeout=4, allow_redirects=True)
+                    if r.status_code == 200 and f"/g/{candidate}" in r.url.lower():
+                        page_head = r.text[:4000].lower()
+                        if "page not found" not in page_head and "404" not in page_head:
+                            modio_slug = candidate
+                            break
+                except Exception:
+                    continue
+
+        if modio_slug:
+            verified_sites.append({
+                "icon": "🟦",
+                "name": "Mod.io",
+                "desc": f"Verified {game_name} mods & maps on Mod.io",
+                "url": f"https://mod.io/g/{modio_slug}"
+            })
+
+        # ------------------------------------------------------------------
+        # 4. CURSEFORGE (Only shown if the game has a verified CurseForge hub)
+        # ------------------------------------------------------------------
+        cf_hyphen = re.sub(r"[^a-z0-9]+", "-", game_name.lower()).strip("-")
+        cf_verified_url = None
+        for candidate in dict.fromkeys([cf_hyphen, norm_title]):
+            if not candidate:
+                continue
+            try:
+                probe_url = f"https://www.curseforge.com/{candidate}"
+                r = requests.get(probe_url, headers=headers, timeout=4, allow_redirects=True)
+                if r.status_code == 200 and f"curseforge.com/{candidate}" in r.url.lower():
+                    page_head = r.text[:4000].lower()
+                    if "page not found" not in page_head and "error 404" not in page_head:
+                        cf_verified_url = probe_url
+                        break
+            except Exception:
+                continue
+
+        if cf_verified_url:
+            verified_sites.append({
+                "icon": "🔥",
+                "name": "CurseForge",
+                "desc": f"Verified {game_name} mods on CurseForge",
+                "url": cf_verified_url
+            })
+
+        cache[appid] = verified_sites
+        cls._save_sites_cache(cache)
+        return verified_sites
+
+
 # ==========================================
 # AUTO-INSTALLABLE MOD LOADER CATALOG
 # ==========================================
@@ -196,7 +720,7 @@ LOADER_CATALOG = {
         "asset_regex": r"\.(zip|7z|rar)$",
         "target_type": "game_root",
         "requires_dotnet_desktop": True,
-        "friendly_name": "ROTTR Version-Independent Mod Tools (TrRebootTools.ModManager.exe / RottrModManager.exe)",
+        "friendly_name": "ROTTR Version-Independent Mod Tools (RottrModManager.exe)",
         "known_files": [
             "TrRebootTools.ModManager.exe", "TrRebootTools.Extractor.exe",
             "RottrModManager.exe", "SottrModManager.exe", "TR9tigetadd.exe",
@@ -302,7 +826,7 @@ KNOWN_GAME_PROFILES = {
         "path_type": "game",
         "rel_path": "",
         "loader_id": "RottrModManager",
-        "loader_name": "ROTTR Version-Independent Mod Tools (Installs directly via Mod Loader into .tiger archives)",
+        "loader_name": "ROTTR Mod Manager (Auto-Configured for Direct .tiger Mod Injection)",
         "loader_check_files": [
             "TrRebootTools.ModManager.exe",
             "RottrModManager.exe",
@@ -314,7 +838,7 @@ KNOWN_GAME_PROFILES = {
         "path_type": "game",
         "rel_path": "",
         "loader_id": "RottrModManager",
-        "loader_name": "TR Reboot Mod Tools (Installs directly via Mod Loader into .tiger archives)",
+        "loader_name": "TR Reboot Mod Tools (Auto-Configured for Direct .tiger Mod Injection)",
         "loader_check_files": [
             "TrRebootTools.ModManager.exe",
             "SottrModManager.exe",
@@ -325,7 +849,7 @@ KNOWN_GAME_PROFILES = {
         "path_type": "game",
         "rel_path": "",
         "loader_id": "RottrModManager",
-        "loader_name": "TR Reboot Mod Tools (Installs directly via Mod Loader into .tiger archives)",
+        "loader_name": "TR Reboot Mod Tools (Auto-Configured for Direct .tiger Mod Injection)",
         "loader_check_files": [
             "TrRebootTools.ModManager.exe",
             "RottrModManager.exe"
@@ -441,236 +965,6 @@ SUPPORTED_ARCHIVES = {".zip", ".rar", ".7z"}
 
 
 # ==========================================
-# LIVE ONLINE MOD SEARCH ENGINE (FOR SEARCH TAB)
-# ==========================================
-class OnlineModSearchEngine:
-    """
-    Searches online mod repositories (Thunderstore API + Nexus Mods / Mod.io / GameBanana / BeamNG / Workshop)
-    for the currently selected game and returns structured mod cards.
-    """
-    _ts_community_map = None
-
-    @classmethod
-    def search_mods(cls, game: dict, query: str, site_filter: str = "All Sites") -> list[dict]:
-        appid = str(game["appid"])
-        game_name = game["name"]
-        results = []
-
-        # 1. If site_filter allows Thunderstore, check if game has live Thunderstore packages (supports 1-click install!)
-        if site_filter in ("All Sites", "Thunderstore"):
-            ts_results = cls._search_thunderstore_packages(game_name, query)
-            results.extend(ts_results)
-
-        # 2. Search Web / Nexus Mods / Mod.io / GameBanana / BeamNG / Steam Workshop
-        web_results = cls._search_web_mod_Portals(appid, game_name, query, site_filter)
-        results.extend(web_results)
-
-        # 3. Always append direct curated portal search cards at the bottom so user can browse full catalogs
-        q_clean = query.strip()
-        portal_cards = cls._build_direct_portal_search_cards(appid, game_name, q_clean, site_filter)
-        results.extend(portal_cards)
-
-        return results
-
-    @classmethod
-    def _search_thunderstore_packages(cls, game_name: str, query: str) -> list[dict]:
-        """Queries Thunderstore API for games on Thunderstore and returns directly downloadable mod packages."""
-        out = []
-        try:
-            headers = {"User-Agent": "NebulaModManager/3.0"}
-            if cls._ts_community_map is None:
-                resp = requests.get(
-                    "https://thunderstore.io/api/experimental/community/",
-                    headers=headers,
-                    timeout=4
-                ).json()
-                cls._ts_community_map = {
-                    re.sub(r"[^a-z0-9]", "", c.get("name", "").lower()): c.get("identifier")
-                    for c in resp.get("results", [])
-                    if c.get("name") and c.get("identifier")
-                }
-
-            norm_name = re.sub(r"[^a-z0-9]", "", game_name.lower())
-            comm_id = cls._ts_community_map.get(norm_name)
-            if not comm_id:
-                return []
-
-            pkg_url = f"https://thunderstore.io/c/{comm_id}/api/v1/package/"
-            pkgs = requests.get(pkg_url, headers=headers, timeout=6).json()
-            if not isinstance(pkgs, list):
-                return []
-
-            q_low = query.strip().lower()
-            matched = []
-            for p in pkgs:
-                if p.get("is_deprecated"):
-                    continue
-                name = p.get("name", "")
-                if name.lower() in {"bepinexpack", "r2modman"}:
-                    continue
-                versions = p.get("versions", [])
-                latest = versions[0] if versions else {}
-                desc = latest.get("description", "")
-                if not q_low or q_low in name.lower() or q_low in desc.lower():
-                    total_dl = sum(v.get("downloads", 0) for v in versions)
-                    matched.append({
-                        "title": name.replace("_", " "),
-                        "author": p.get("owner", "Community"),
-                        "site": "Thunderstore",
-                        "desc": f"{desc}  •  ⬇️ {total_dl:,} downloads",
-                        "page_url": p.get("package_url", "https://thunderstore.io"),
-                        "direct_download_url": latest.get("download_url"),
-                        "archive_filename": f"{p.get('full_name', name)}.zip"
-                    })
-
-            matched.sort(key=lambda x: x["desc"], reverse=True)
-            out.extend(matched[:15])
-        except Exception:
-            pass
-        return out
-
-    @classmethod
-    def _search_web_mod_Portals(cls, appid: str, game_name: str, query: str, site_filter: str) -> list[dict]:
-        """Queries DuckDuckGo HTML for specific mod pages across Nexus Mods, Mod.io, GameBanana, BeamNG, and Workshop."""
-        results = []
-        try:
-            site_clause = (
-                "(site:nexusmods.com OR site:mod.io OR site:gamebanana.com "
-                "OR site:beamng.com/resources OR site:steamcommunity.com/sharedfiles)"
-            )
-            if site_filter == "Nexus Mods":
-                if appid in NEXUS_GAME_SLUGS:
-                    site_clause = f"site:nexusmods.com/{NEXUS_GAME_SLUGS[appid]}/mods"
-                else:
-                    site_clause = "site:nexusmods.com"
-            elif site_filter == "Mod.io":
-                site_clause = "site:mod.io"
-            elif site_filter == "GameBanana":
-                site_clause = "site:gamebanana.com"
-            elif site_filter == "Steam Workshop":
-                site_clause = "site:steamcommunity.com/sharedfiles"
-
-            search_terms = f'"{game_name}" {query.strip() if query.strip() else "mods"} {site_clause}'
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                )
-            }
-            resp = requests.get(
-                f"https://html.duckduckgo.com/html/?q={quote_plus(search_terms)}",
-                headers=headers,
-                timeout=5
-            )
-            if resp.status_code != 200:
-                return []
-
-            blocks = re.findall(
-                r'<a class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
-                r'<a class="result__snippet"[^>]*>(.*?)</a>',
-                resp.text,
-                flags=re.DOTALL
-            )
-
-            seen_urls = set()
-            for raw_href, raw_title, raw_snippet in blocks:
-                url = raw_href
-                uddg_m = re.search(r"uddg=([^&]+)", raw_href)
-                if uddg_m:
-                    url = unquote(uddg_m.group(1))
-
-                if url in seen_urls or not url.startswith("http"):
-                    continue
-                seen_urls.add(url)
-
-                clean_title = html.unescape(re.sub(r"<[^>]+>", "", raw_title)).strip()
-                clean_snippet = html.unescape(re.sub(r"<[^>]+>", "", raw_snippet)).strip()
-
-                site_badge = "Web Mod"
-                url_low = url.lower()
-                if "nexusmods.com" in url_low:
-                    site_badge = "Nexus Mods"
-                elif "mod.io" in url_low:
-                    site_badge = "Mod.io"
-                elif "gamebanana.com" in url_low:
-                    site_badge = "GameBanana"
-                elif "beamng.com" in url_low:
-                    site_badge = "BeamNG Repo"
-                elif "steamcommunity.com" in url_low:
-                    site_badge = "Steam Workshop"
-                elif "moddb.com" in url_low:
-                    site_badge = "ModDB"
-
-                results.append({
-                    "title": clean_title[:85],
-                    "author": site_badge,
-                    "site": site_badge,
-                    "desc": clean_snippet[:180] if clean_snippet else f"Mod page on {site_badge}",
-                    "page_url": url,
-                    "direct_download_url": None
-                })
-                if len(results) >= 14:
-                    break
-        except Exception:
-            pass
-        return results
-
-    @staticmethod
-    def _build_direct_portal_search_cards(appid: str, game_name: str, query: str, site_filter: str) -> list[dict]:
-        q_combined = quote_plus(f"{game_name} {query}".strip())
-        q_only = quote_plus(query) if query else ""
-        cards = []
-
-        if site_filter in ("All Sites", "Nexus Mods"):
-            if appid in NEXUS_GAME_SLUGS:
-                slug = NEXUS_GAME_SLUGS[appid]
-                url = f"https://www.nexusmods.com/{slug}/search/?gsearch={q_only}&gsearchtype=mods" if query else f"https://www.nexusmods.com/{slug}/mods/"
-            else:
-                url = f"https://www.nexusmods.com/games?search={quote_plus(game_name)}"
-            cards.append({
-                "title": f"Search '{query or 'All Popular Mods'}' on Nexus Mods ({game_name})",
-                "author": "Official Hub",
-                "site": "Nexus Mods",
-                "desc": "Open Nexus Mods directly to browse and download .zip / .rar / .7z archives for this game.",
-                "page_url": url,
-                "direct_download_url": None
-            })
-
-        if site_filter in ("All Sites", "Mod.io"):
-            url = f"https://mod.io/g/readyornot?_q={q_only}" if appid == "1144200" else f"https://mod.io/g?_q={q_combined}"
-            cards.append({
-                "title": f"Browse '{query or game_name}' on Mod.io",
-                "author": "Official Hub",
-                "site": "Mod.io",
-                "desc": "Browse Mod.io packages and download zip archives to drag-and-drop into Nebula.",
-                "page_url": url,
-                "direct_download_url": None
-            })
-
-        if site_filter in ("All Sites", "GameBanana"):
-            cards.append({
-                "title": f"Search '{query or game_name}' on GameBanana",
-                "author": "Official Hub",
-                "site": "GameBanana",
-                "desc": "Find custom skins, sounds, UI, and model mods on GameBanana.",
-                "page_url": f"https://gamebanana.com/search?_sSearchString={q_combined}",
-                "direct_download_url": None
-            })
-
-        if appid == "284160" or "beamng" in game_name.lower():
-            cards.insert(0, {
-                "title": f"BeamNG.drive Official Repository ({query or 'All Mods'})",
-                "author": "BeamNG Official",
-                "site": "BeamNG Repo",
-                "desc": "Download official BeamNG .zip mods and drop them straight into Nebula (/current/mods/repo).",
-                "page_url": "https://www.beamng.com/resources/",
-                "direct_download_url": None
-            })
-
-        return cards
-
-
-# ==========================================
 # PRE-INSTALL ARCHIVE CONTENT INSPECTOR
 # ==========================================
 class ArchiveModInspector:
@@ -695,7 +989,7 @@ class ArchiveModInspector:
                 "loader_id": None,
                 "loader_name": None,
                 "target_dir": default_mod_target_dir,
-                "mod_type_label": "BeamNG Repo Archive (.zip)",
+                "mod_type_label": "BeamNG Mod",
                 "sub_mode": "beamng_repo_zip"
             }
 
@@ -748,7 +1042,7 @@ class ArchiveModInspector:
                 "loader_id": "RottrModManager",
                 "loader_name": loader_name or "ROTTR Version-Independent Mod Tools",
                 "target_dir": game_root,
-                "mod_type_label": "Direct Mod Loader Injection (.tiger)",
+                "mod_type_label": "Tomb Raider Mod",
                 "sub_mode": "rottr_direct_loader"
             }
 
@@ -769,7 +1063,7 @@ class ArchiveModInspector:
                     "loader_id": None,
                     "loader_name": None,
                     "target_dir": movies_dir,
-                    "mod_type_label": "Video / Movie Mod (Content/Movies)",
+                    "mod_type_label": "Video Mod",
                     "sub_mode": "ue_movies"
                 }
 
@@ -785,7 +1079,7 @@ class ArchiveModInspector:
                     "loader_id": None,
                     "loader_name": None,
                     "target_dir": fmod_dir,
-                    "mod_type_label": "Audio Bank Mod (Content/FMOD)",
+                    "mod_type_label": "Audio Mod",
                     "sub_mode": "ue_fmod"
                 }
 
@@ -804,7 +1098,7 @@ class ArchiveModInspector:
                     "loader_id": "UE4SS",
                     "loader_name": loader_name or "UE4SS (Unreal Engine Scripting System)",
                     "target_dir": ue4ss_mods_dir,
-                    "mod_type_label": "UE4SS Script / DLL Mod",
+                    "mod_type_label": "UE4SS Script Mod",
                     "sub_mode": "ue4ss_mod"
                 }
 
@@ -817,7 +1111,7 @@ class ArchiveModInspector:
                     "loader_id": "UE4SS",
                     "loader_name": loader_name or "UE4SS (Blueprint LogicMods Loader)",
                     "target_dir": logic_mods_dir,
-                    "mod_type_label": "UE4SS Blueprint LogicMod (.pak)",
+                    "mod_type_label": "LogicMod",
                     "sub_mode": "ue_logicmod"
                 }
 
@@ -829,7 +1123,7 @@ class ArchiveModInspector:
                     "loader_id": None,
                     "loader_name": None,
                     "target_dir": default_mod_target_dir,
-                    "mod_type_label": "Unreal Engine Pak Mod (Content/Paks)",
+                    "mod_type_label": "Pak Mod",
                     "sub_mode": "ue_pak"
                 }
 
@@ -848,7 +1142,7 @@ class ArchiveModInspector:
                 "loader_id": loader_id,
                 "loader_name": loader_name or f"{loader_id} (Unity Mod Loader)",
                 "target_dir": target,
-                "mod_type_label": f"{loader_id} Plugin Mod",
+                "mod_type_label": f"{loader_id} Mod",
                 "sub_mode": "unity_mod"
             }
 
@@ -862,7 +1156,7 @@ class ArchiveModInspector:
                         "loader_id": se_label,
                         "loader_name": f"{se_label} (Script Extender)",
                         "target_dir": game_root / "Data",
-                        "mod_type_label": f"{se_label} Native Plugin Mod",
+                        "mod_type_label": f"{se_label} Mod",
                         "sub_mode": "standard"
                     }
 
@@ -873,13 +1167,13 @@ class ArchiveModInspector:
             "loader_id": loader_id,
             "loader_name": loader_name,
             "target_dir": default_mod_target_dir,
-            "mod_type_label": "Game Mod",
+            "mod_type_label": "Mod",
             "sub_mode": "standard"
         }
 
 
 # ==========================================
-# AUTOMATIC MOD LOADER INSTALLER & UNINSTALLER
+# AUTOMATIC MOD LOADER INSTALLER & ROTTR PATH FIXER
 # ==========================================
 class ModLoaderAutoInstaller:
     @staticmethod
@@ -929,6 +1223,92 @@ class ModLoaderAutoInstaller:
             game_root / "TrRebootTools.ModManager.exe"
         ]
         return any(p.exists() for p in common_checks)
+
+    @classmethod
+    def configure_rottr_game_path(cls, game_root: Path, appid: str = "391220"):
+        """
+        Fixes the 'Could not automatically determine the Rise of the Tomb Raider installation folder' error
+        by automatically pre-populating:
+          1. All Registry keys referenced inside RottrModManager.exe / TrRebootTools.ModManager.exe
+          2. Steam's Uninstall Registry key (Steam App 391220 -> InstallLocation)
+          3. A zero-admin Windows Directory Junction at <DefaultSteamRoot>\\steamapps\\common\\Rise of the Tomb Raider
+             if the game is installed on a secondary drive (e.g. E:\\SteamLibrary).
+        """
+        if sys.platform != "win32":
+            return
+
+        game_path_str = str(game_root.resolve())
+
+        try:
+            import winreg
+
+            # 1. Pre-populate Steam Uninstall Registry keys (checked by RottrModManager to locate the game)
+            uninstall_subkeys = [
+                rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {appid}",
+                rf"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {appid}",
+            ]
+            for root_hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for subk in uninstall_subkeys:
+                    try:
+                        with winreg.CreateKeyEx(root_hive, subk, 0, winreg.KEY_SET_VALUE) as key:
+                            winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, game_path_str)
+                    except OSError:
+                        continue
+
+            # 2. Pre-populate RottrModManager / TrRebootTools / Square Enix registry keys
+            candidate_reg_keys = [
+                r"Software\RottrModManager",
+                r"Software\SottrModManager",
+                r"Software\TrRebootTools",
+                r"Software\ArcusMaximus\RottrModManager",
+                r"Software\Crystal Dynamics\Rise of the Tomb Raider",
+                r"Software\Square Enix\Rise of the Tomb Raider",
+            ]
+
+            # Also dynamically extract any Software\... registry paths embedded inside RottrModManager.exe
+            rottr_exe = cls.get_rottr_manager_exe(game_root)
+            if rottr_exe and rottr_exe.exists():
+                try:
+                    raw_bytes = rottr_exe.read_bytes()
+                    utf16_strings = [
+                        m.decode("utf-16le", errors="ignore")
+                        for m in re.findall(rb"(?:[A-Za-z0-9_\\.\- ]\x00){4,}", raw_bytes)
+                    ]
+                    for s in utf16_strings:
+                        if s.lower().startswith("software\\") and len(s) < 120:
+                            candidate_reg_keys.append(s)
+                except Exception:
+                    pass
+
+            value_names = [
+                "", "GameFolderPath", "GameFolder", "InstallLocation", "InstallPath",
+                "GamePath", "FolderPath", "Path", "RottrFolderPath", "RiseOfTheTombRaiderPath"
+            ]
+            for reg_subkey in dict.fromkeys(candidate_reg_keys):
+                try:
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_subkey, 0, winreg.KEY_SET_VALUE) as k:
+                        for v_name in value_names:
+                            winreg.SetValueEx(k, v_name, 0, winreg.REG_SZ, game_path_str)
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+        # 3. Create a Directory Junction at <SteamRoot>\steamapps\common\<GameFolderName> if on another drive
+        try:
+            steam_root = SteamScanner.get_steam_root()
+            if steam_root and steam_root.exists():
+                default_common = steam_root / "steamapps" / "common"
+                if default_common.exists():
+                    expected_default_dir = default_common / game_root.name
+                    if not expected_default_dir.exists() and expected_default_dir.resolve() != game_root.resolve():
+                        subprocess.run(
+                            ["cmd", "/c", "mklink", "/J", str(expected_default_dir), game_path_str],
+                            capture_output=True,
+                            creationflags=0x08000000
+                        )
+        except Exception:
+            pass
 
     @staticmethod
     def check_dotnet_desktop_runtime() -> bool:
@@ -1039,6 +1419,9 @@ class ModLoaderAutoInstaller:
                 except ValueError:
                     recorded_files.append(str(dest_file))
 
+        if detected_loader_id == "RottrModManager":
+            cls.configure_rottr_game_path(game_root, appid)
+
         manifest = cls._load_loader_manifest()
         manifest[appid] = {
             "loader_id": detected_loader_id,
@@ -1070,7 +1453,7 @@ class ModLoaderAutoInstaller:
 
         headers = {
             "Accept": "application/vnd.github+json",
-            "User-Agent": "NebulaModManager/3.0"
+            "User-Agent": f"NebulaModManager/{APP_VERSION}"
         }
 
         repo_slug = catalog_entry["github_repo"] if catalog_entry else None
@@ -1196,6 +1579,8 @@ class ModLoaderAutoInstaller:
                 (game_root / "Mods").mkdir(parents=True, exist_ok=True)
             elif resolved_id == "UE4SS":
                 (install_dest / "ue4ss" / "Mods").mkdir(parents=True, exist_ok=True)
+            elif resolved_id == "RottrModManager":
+                cls.configure_rottr_game_path(game_root, appid)
 
             manifest = cls._load_loader_manifest()
             manifest[appid] = {
@@ -1382,6 +1767,10 @@ class SmartModRouter:
         game_name = game["name"]
         game_root = Path(game["install_dir"])
 
+        # Automatically pre-configure ROTTR / Tomb Raider registry & junction so the loader never errors!
+        if appid in {"391220", "750920", "203160"} or any(game_root.glob("*.tiger")):
+            ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
+
         local_appdata = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         roaming_appdata = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
         documents_dir = Path.home() / "Documents"
@@ -1475,7 +1864,7 @@ class SmartModRouter:
             if any(game_root.glob("bigfile.*.tiger")) or any(game_root.glob("*.tiger")):
                 info["engine"] = "foundation_tiger"
                 info["loader_id"] = "RottrModManager"
-                info["loader_name"] = "ROTTR Version-Independent Mod Tools (Installs directly via Mod Loader)"
+                info["loader_name"] = "ROTTR Mod Manager (Auto-Configured for Direct .tiger Mod Injection)"
                 info["check_files"] = [
                     "TrRebootTools.ModManager.exe", "RottrModManager.exe",
                     "SottrModManager.exe", "ROTTRTigetAdd.exe", "InstallMod.bat"
@@ -1553,23 +1942,12 @@ class SmartModRouter:
             pass
 
         if not info["loader_id"]:
-            try:
-                if cls._thunderstore_cache is None:
-                    ts_resp = requests.get(
-                        "https://thunderstore.io/api/experimental/community/", timeout=4
-                    ).json()
-                    cls._thunderstore_cache = ts_resp.get("results", [])
-
-                norm_game = re.sub(r"[^a-z0-9]", "", game_name.lower())
-                for comm in cls._thunderstore_cache or []:
-                    comm_name = re.sub(r"[^a-z0-9]", "", str(comm.get("name", "")).lower())
-                    if comm_name and comm_name == norm_game:
-                        info["loader_id"] = "BepInEx"
-                        info["loader_name"] = "BepInEx 5 (Unity Mod Loader)"
-                        info["check_files"] = ["winhttp.dll", "BepInEx/core/BepInEx.dll"]
-                        break
-            except Exception:
-                pass
+            ts_map = ModSiteVerifier._ensure_thunderstore_map()
+            norm_game = ModSiteVerifier._norm(game_name)
+            if norm_game in ts_map:
+                info["loader_id"] = "BepInEx"
+                info["loader_name"] = "BepInEx 5 (Unity Mod Loader)"
+                info["check_files"] = ["winhttp.dll", "BepInEx/core/BepInEx.dll"]
 
         cache[appid] = info
         cls._save_online_cache(cache)
@@ -1635,7 +2013,7 @@ class SmartModRouter:
                 return data_dir, "🌐 Auto-Detected (Creation Engine Data)"
 
         if online_info.get("engine") == "foundation_tiger":
-            return game_root, "🌐 Direct Mod Loader Injection (TrRebootTools / RottrModManager)"
+            return game_root, "🌐 Direct Mod Loader Injection (RottrModManager)"
 
         for candidate in ("Mods", "mods", "addons", "mod", "nativePC"):
             if (game_root / candidate).exists() and (game_root / candidate).is_dir():
@@ -1676,8 +2054,8 @@ class SmartModRouter:
 
         if str(appid) in {"391220", "750920", "203160"}:
             has_dotnet = ModLoaderAutoInstaller.check_dotnet_desktop_runtime()
-            dotnet_tag = "✅ .NET Runtime OK" if has_dotnet else "⚠️ Missing .NET Desktop Runtime"
-            status_str = f"✅ Loader Detected ({dotnet_tag})" if installed else f"❌ Loader Not Installed ({dotnet_tag})"
+            dotnet_tag = "✅ Path & Runtime Ready" if has_dotnet else "⚠️ Missing .NET Runtime"
+            status_str = f"✅ Loader Installed ({dotnet_tag})" if installed else f"❌ Loader Not Installed ({dotnet_tag})"
             return f"ℹ️ Mod Loader: {loader_name}  •  [{status_str}]", search_query, installed
 
         status_str = "✅ Detected in Game Folder" if installed else "❌ Not Installed — Click Auto-Install!"
@@ -1745,13 +2123,16 @@ class SmartModRouter:
                         zf.write(f_item, f_item.relative_to(staging_dir))
             return [str(dest_zip)]
 
-        # 2. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013 (Direct Mod Loader injection)
+        # 2. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013:
+        #    Pre-configure the game path so RottrModManager NEVER shows the folder error,
+        #    then pass the archive directly into RottrModManager.exe!
         if str(appid) in {"391220", "750920", "203160"} or sub_mode == "rottr_direct_loader":
+            ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
             rottr_exe = ModLoaderAutoInstaller.get_rottr_manager_exe(game_root)
             if not rottr_exe:
                 raise RuntimeError(
-                    "Tomb Raider Mod Loader (TrRebootTools.ModManager.exe / RottrModManager.exe) "
-                    "was not found in the game folder. Please click 'Auto-Install Loader' first."
+                    "Tomb Raider Mod Loader (RottrModManager.exe) was not found in the game folder. "
+                    "Please click 'Auto-Install Loader' first."
                 )
 
             saved_archive = ROTTR_ARCHIVES_DIR / archive_path.name
@@ -1759,14 +2140,20 @@ class SmartModRouter:
 
             before_files = {}
             for p in game_root.rglob("*"):
-                if p.is_file() and (p.suffix.lower() == ".tiger" or "mods" in {pt.lower() for pt in p.relative_to(game_root).parts}):
+                if p.is_file() and (
+                    p.suffix.lower() == ".tiger"
+                    or "mods" in {pt.lower() for pt in p.relative_to(game_root).parts}
+                ):
                     before_files[str(p.relative_to(game_root))] = p.stat().st_mtime
 
             proc = subprocess.Popen([str(rottr_exe), str(saved_archive)], cwd=str(rottr_exe.parent))
             proc.wait()
 
             for p in game_root.rglob("*"):
-                if p.is_file() and (p.suffix.lower() == ".tiger" or "mods" in {pt.lower() for pt in p.relative_to(game_root).parts}):
+                if p.is_file() and (
+                    p.suffix.lower() == ".tiger"
+                    or "mods" in {pt.lower() for pt in p.relative_to(game_root).parts}
+                ):
                     rel_str = str(p.relative_to(game_root))
                     if rel_str not in before_files or p.stat().st_mtime > before_files[rel_str]:
                         installed_paths.append(rel_str)
@@ -1987,10 +2374,6 @@ class SteamScanner:
 
     @classmethod
     def scan_installed_games(cls) -> list[dict]:
-        """
-        Ultra-fast Steam manifest reader (< 25ms).
-        Does NOT run slow os.walk() on startup; anti-cheat inspection is deferred until a game is clicked!
-        """
         games = []
         seen_ids = set()
 
@@ -2018,7 +2401,8 @@ class SteamScanner:
                             "appid": appid,
                             "name": name,
                             "install_dir": str(install_dir),
-                            "has_anticheat_or_mp": None  # Evaluated lazily in background when selected
+                            "has_anticheat_or_mp": None,
+                            "verified_mod_sites": None
                         })
                 except Exception:
                     continue
@@ -2052,14 +2436,12 @@ class SteamScanner:
             game["has_anticheat_or_mp"] = res
             return res
 
-        # 1. Fast local directory check
         local_ac = cls.detect_local_anticheat(Path(game["install_dir"]))
         if local_ac:
             cache_flag.write_text("1")
             game["has_anticheat_or_mp"] = True
             return True
 
-        # 2. Steam Store API category check
         mp_category_ids = {1, 8, 9, 20, 27, 36, 38, 49}
         is_mp = False
         try:
@@ -2103,6 +2485,16 @@ class ModController:
     def get_enabled_mod_count(self, appid: str) -> int:
         mods = self.get_mods_for_game(str(appid))
         return sum(1 for m in mods if m.get("enabled", True))
+
+    def rename_mod(self, appid: str, mod_id: str, new_name: str) -> bool:
+        mods = self.manifest.get(str(appid), [])
+        for m in mods:
+            if m["id"] == mod_id:
+                m["name"] = new_name.strip()
+                m["custom_named"] = True
+                self._save_manifest()
+                return True
+        return False
 
     @staticmethod
     def _resolve_file_path(game_dir: Path, stored_path: str) -> Path:
@@ -2197,6 +2589,8 @@ class ModController:
         mod_type_label = inspection.get("mod_type_label", "Mod")
 
         try:
+            clean_display_name = format_simple_mod_name(archive.stem, staging_dir)
+
             installed_files = SmartModRouter.smart_place_extracted_files(
                 archive_path=archive,
                 staging_dir=staging_dir,
@@ -2223,7 +2617,7 @@ class ModController:
 
             mod_entry = {
                 "id": f"{archive.stem}_{int(datetime.now().timestamp())}",
-                "name": archive.stem,
+                "name": clean_display_name,
                 "archive_name": archive.name,
                 "mod_type": mod_type_label,
                 "target_subpath": rel_target_display,
@@ -2235,7 +2629,7 @@ class ModController:
             self._save_manifest()
             return (
                 True,
-                f"✅ Installed '{archive.name}' [{mod_type_label}] into {rel_target_display} ({len(installed_files)} file(s))."
+                f"✅ Installed '{clean_display_name}' into {rel_target_display} ({len(installed_files)} file(s))."
             )
         except Exception as e:
             return False, f"Installation error: {str(e)}"
@@ -2384,25 +2778,29 @@ class ModController:
 
 
 # ==========================================
-# MOD WEBSITES HUB DIALOG
+# MOD WEBSITES HUB DIALOG (VERIFIED PER GAME)
 # ==========================================
 class ModSitesDialog(ctk.CTkToplevel):
+    """
+    Displays ONLY verified modding websites that actually have a hub/mods for the selected game,
+    linking directly to the game's exact URL on each site.
+    """
+
     def __init__(self, parent, game: dict):
         super().__init__(parent)
         self.game = game
-        appid = str(game["appid"])
         game_name = game["name"]
 
-        self.title(f"Download Mods for {game_name}")
-        self.geometry("640x520")
+        self.title(f"Verified Mod Sites — {game_name}")
+        self.geometry("620x390")
         self.resizable(False, False)
         self.configure(fg_color=THEME["bg_root"])
         self.transient(parent)
         self.grab_set()
 
         self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width() // 2) - 320
-        py = parent.winfo_rooty() + (parent.winfo_height() // 2) - 260
+        px = parent.winfo_rootx() + (parent.winfo_width() // 2) - 310
+        py = parent.winfo_rooty() + (parent.winfo_height() // 2) - 195
         self.geometry(f"+{max(px, 50)}+{max(py, 50)}")
 
         header = ctk.CTkFrame(self, fg_color=THEME["bg_card"], corner_radius=12)
@@ -2410,29 +2808,60 @@ class ModSitesDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             header,
-            text=f"🌐  Mod Websites for {game_name}",
+            text=f"🌐  Verified Mod Sites for {game_name}",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=THEME["text_main"]
         ).pack(padx=16, pady=(12, 2), anchor="w")
 
         ctk.CTkLabel(
             header,
-            text="Click any website below to download mod archives (.zip, .rar, .7z), then drag & drop them into Nebula!",
+            text="Only sites confirmed to host mods for this game are listed below:",
             font=ctk.CTkFont(size=12),
             text_color=THEME["text_muted"]
         ).pack(padx=16, pady=(0, 12), anchor="w")
 
-        scroll = ctk.CTkScrollableFrame(
+        self.scroll = ctk.CTkScrollableFrame(
             self,
             fg_color="transparent",
             scrollbar_button_color=THEME["accent"]
         )
-        scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        scroll.grid_columnconfigure(0, weight=1)
+        self.scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.scroll.grid_columnconfigure(0, weight=1)
 
-        sites = self._build_sites_for_game(appid, game_name)
+        cached_sites = game.get("verified_mod_sites")
+        if cached_sites is not None:
+            self._render_sites(cached_sites)
+        else:
+            self.loading_lbl = ctk.CTkLabel(
+                self.scroll,
+                text=f"🔍 Checking Nexus Mods, Thunderstore, Mod.io & CurseForge for {game_name}...",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=THEME["text_muted"]
+            )
+            self.loading_lbl.grid(row=0, column=0, pady=45)
+            threading.Thread(target=self._verify_worker, daemon=True).start()
+
+    def _verify_worker(self):
+        sites = ModSiteVerifier.verify_sites_for_game(self.game)
+        self.game["verified_mod_sites"] = sites
+        if self.winfo_exists():
+            self.after(0, lambda: self._render_sites(sites))
+
+    def _render_sites(self, sites: list[dict]):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+
+        if not sites:
+            ctk.CTkLabel(
+                self.scroll,
+                text=f"No dedicated mod repositories were found for {self.game['name']}.",
+                font=ctk.CTkFont(size=13),
+                text_color=THEME["text_muted"]
+            ).grid(row=0, column=0, pady=45)
+            return
+
         for idx, site in enumerate(sites):
-            row = ctk.CTkFrame(scroll, fg_color=THEME["bg_card"], corner_radius=10)
+            row = ctk.CTkFrame(self.scroll, fg_color=THEME["bg_card"], corner_radius=10)
             row.grid(row=idx, column=0, sticky="ew", padx=4, pady=5)
             row.grid_columnconfigure(0, weight=1)
 
@@ -2464,81 +2893,6 @@ class ModSitesDialog(ctk.CTkToplevel):
                 command=lambda u=site["url"]: webbrowser.open(u)
             )
             open_btn.grid(row=0, column=1, padx=14, pady=10, sticky="e")
-
-    @staticmethod
-    def _build_sites_for_game(appid: str, game_name: str) -> list[dict]:
-        q_name = quote_plus(game_name)
-        sites = []
-
-        if appid in NEXUS_GAME_SLUGS:
-            nexus_url = f"https://www.nexusmods.com/{NEXUS_GAME_SLUGS[appid]}/mods/"
-            nexus_desc = f"Official {game_name} Nexus Mods hub (Largest collection of mods)"
-        else:
-            nexus_url = f"https://www.nexusmods.com/games?search={q_name}"
-            nexus_desc = f"Search {game_name} mods on Nexus Mods"
-
-        sites.append({
-            "icon": "🔶",
-            "name": "Nexus Mods",
-            "desc": nexus_desc,
-            "url": nexus_url
-        })
-
-        if appid == "284160" or "beamng" in game_name.lower():
-            sites.insert(0, {
-                "icon": "🚗",
-                "name": "BeamNG Official Repository",
-                "desc": "Official BeamNG.drive vehicles, maps, and gameplay mods (.zip)",
-                "url": "https://www.beamng.com/resources/"
-            })
-
-        if appid == "1144200":
-            modio_url = "https://mod.io/g/readyornot"
-        else:
-            modio_url = f"https://mod.io/g?_q={q_name}"
-        sites.append({
-            "icon": "🟦",
-            "name": "Mod.io",
-            "desc": f"Browse community mods & maps for {game_name} on Mod.io",
-            "url": modio_url
-        })
-
-        sites.append({
-            "icon": "🍌",
-            "name": "GameBanana",
-            "desc": f"Skins, audio, UI, and gameplay mods for {game_name}",
-            "url": f"https://gamebanana.com/search?_sSearchString={q_name}"
-        })
-
-        sites.append({
-            "icon": "🛠️",
-            "name": "ModDB",
-            "desc": f"Overhauls, archives, and standalone mods for {game_name}",
-            "url": f"https://www.moddb.com/search?q={q_name}&sa=Search"
-        })
-
-        sites.append({
-            "icon": "⚡",
-            "name": "Thunderstore",
-            "desc": f"BepInEx & Unity community mod packages for {game_name}",
-            "url": "https://thunderstore.io/"
-        })
-
-        sites.append({
-            "icon": "🔥",
-            "name": "CurseForge",
-            "desc": f"Search {game_name} mod projects on CurseForge",
-            "url": f"https://www.curseforge.com/games?search={q_name}"
-        })
-
-        sites.append({
-            "icon": "🎮",
-            "name": "Steam Community Workshop",
-            "desc": f"Open the Steam Community Hub & Workshop for {game_name}",
-            "url": f"https://steamcommunity.com/app/{appid}/workshop/"
-        })
-
-        return sites
 
 
 # ==========================================
@@ -2660,12 +3014,12 @@ class NebulaModManagerApp(BaseWindowClass):
     def __init__(self):
         super().__init__()
         ctk.set_appearance_mode("dark")
-        self.title("Nebula — Smart Steam Mod Manager")
-        self.geometry("1280x820")
+        self.title(f"Nebula — Smart Steam Mod Manager (v{APP_VERSION})")
+        self.geometry("1280x810")
         self.minsize(1080, 680)
         self.configure(fg_color=THEME["bg_root"])
 
-        # 1. Build & render Welcome Splash Screen FIRST so the window appears on screen in < 0.1s!
+        # 1. Build & render Welcome Splash Screen FIRST so the window appears in < 0.1s!
         self._build_welcome_splash_screen()
         self.update()
 
@@ -2681,7 +3035,6 @@ class NebulaModManagerApp(BaseWindowClass):
         self.placeholder_thumb_ctk = ctk.CTkImage(light_image=thumb_pil, dark_image=thumb_pil, size=(92, 43))
         self.placeholder_banner_ctk = ctk.CTkImage(light_image=banner_pil, dark_image=banner_pil, size=(184, 86))
 
-        # Bounded thread pool for cover images so we never spawn 100+ threads at once
         self.cover_executor = ThreadPoolExecutor(max_workers=4)
 
         self.mod_controller = ModController()
@@ -2693,7 +3046,6 @@ class NebulaModManagerApp(BaseWindowClass):
         self.current_loader_installed = False
         self.current_loader_search_query = None
         self.sidebar_filter_mode = "All Games"
-        self.active_workspace_tab = "📦 Manage & Install Mods"
         self.game_tab_widgets = {}
         self.image_cache = {}
         self._search_debounce_job = None
@@ -2702,7 +3054,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self._welcome_scan_done = False
         self._scanned_games_buffer = []
 
-        # 2. Build main layout behind the welcome splash screen and start fast boot sequence
+        # 2. Build main layout behind the welcome splash screen and start fast boot + update check
         self._build_layout()
         self.welcome_frame.lift()
         self.after(20, self._start_welcome_boot_sequence)
@@ -2779,6 +3131,7 @@ class NebulaModManagerApp(BaseWindowClass):
         sidebar_footer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         sidebar_footer.grid(row=4, column=0, padx=16, pady=12, sticky="ew")
         sidebar_footer.grid_columnconfigure(0, weight=1)
+        sidebar_footer.grid_columnconfigure(1, weight=1)
 
         rescan_btn = ctk.CTkButton(
             sidebar_footer,
@@ -2788,20 +3141,33 @@ class NebulaModManagerApp(BaseWindowClass):
             command=self._rescan_steam_games_click,
             height=34
         )
-        rescan_btn.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        rescan_btn.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
-        github_bug_btn = ctk.CTkButton(
+        report_bug_btn = ctk.CTkButton(
             sidebar_footer,
-            text="🐛 Report Bug / GitHub Source",
+            text="🐛 Report Bug",
             fg_color="#1e1b4b",
             hover_color="#312e81",
             border_color=THEME["accent"],
             border_width=1,
             text_color="#c4b5fd",
-            command=lambda: webbrowser.open(GITHUB_ISSUES_URL),
+            command=self._open_github_bug_report,
             height=32
         )
-        github_bug_btn.grid(row=1, column=0, sticky="ew")
+        report_bug_btn.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+
+        github_source_btn = ctk.CTkButton(
+            sidebar_footer,
+            text="⭐ GitHub Source",
+            fg_color="#1e1b4b",
+            hover_color="#312e81",
+            border_color=THEME["accent"],
+            border_width=1,
+            text_color="#c4b5fd",
+            command=lambda: webbrowser.open(GITHUB_REPO_URL),
+            height=32
+        )
+        github_source_btn.grid(row=1, column=1, sticky="ew", padx=(4, 0))
 
         # ---- RIGHT CONTENT PANEL ----
         self.main_panel = ctk.CTkFrame(self, fg_color=THEME["bg_root"], corner_radius=0)
@@ -2817,7 +3183,7 @@ class NebulaModManagerApp(BaseWindowClass):
             border_width=1,
             corner_radius=12
         )
-        self.header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.header_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         self.header_frame.grid_columnconfigure(1, weight=1)
 
         self.banner_img_lbl = ctk.CTkLabel(
@@ -2858,6 +3224,7 @@ class NebulaModManagerApp(BaseWindowClass):
         )
         self.mod_target_lbl.pack(anchor="w", pady=(4, 0))
 
+        # Top-Right Action Buttons Grid (Mod Sites appears ONLY here)
         btn_grid = ctk.CTkFrame(self.header_frame, fg_color="transparent")
         btn_grid.grid(row=0, column=2, padx=14, pady=10)
 
@@ -2867,7 +3234,7 @@ class NebulaModManagerApp(BaseWindowClass):
             fg_color=THEME["play_bg"],
             hover_color=THEME["play_hover"],
             font=ctk.CTkFont(size=13, weight="bold"),
-            width=140,
+            width=145,
             height=32,
             command=self._launch_selected_game,
             state="disabled"
@@ -2880,7 +3247,7 @@ class NebulaModManagerApp(BaseWindowClass):
             fg_color=THEME["sites_bg"],
             hover_color=THEME["sites_hover"],
             font=ctk.CTkFont(size=13, weight="bold"),
-            width=140,
+            width=145,
             height=32,
             command=self._open_mod_sites_dialog,
             state="disabled"
@@ -2892,7 +3259,7 @@ class NebulaModManagerApp(BaseWindowClass):
             text="Open Mod Folder",
             fg_color=THEME["accent"],
             hover_color=THEME["accent_hover"],
-            width=140,
+            width=145,
             height=30,
             command=self._open_mod_folder,
             state="disabled"
@@ -2906,7 +3273,7 @@ class NebulaModManagerApp(BaseWindowClass):
             hover_color=THEME["bg_card_hover"],
             border_color=THEME["accent"],
             border_width=1,
-            width=140,
+            width=145,
             height=30,
             command=self._change_mod_target_dialog,
             state="disabled"
@@ -2987,68 +3354,16 @@ class NebulaModManagerApp(BaseWindowClass):
         )
         self.delete_loader_btn.pack(side="left")
 
-        # 4. Workspace Mode Switcher Tab Bar (Manage & Install Mods vs Search Mods Online)
-        self.workspace_tab_switcher = ctk.CTkSegmentedButton(
-            self.main_panel,
-            values=["📦 Manage & Install Mods", "🔍 Search Mods Online"],
-            selected_color=THEME["accent"],
-            selected_hover_color=THEME["accent_hover"],
-            unselected_color=THEME["bg_card"],
-            unselected_hover_color=THEME["bg_card_hover"],
-            text_color=THEME["text_main"],
-            font=ctk.CTkFont(size=14, weight="bold"),
-            height=38,
-            command=self._on_workspace_tab_changed
-        )
-        self.workspace_tab_switcher.set("📦 Manage & Install Mods")
-        self.workspace_tab_switcher.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-
-        # 5. Dynamic Workspace Container (Holds Tab 1: Manage Mods AND Tab 2: Search Mods)
-        self.workspace_body = ctk.CTkFrame(self.main_panel, fg_color="transparent")
-        self.workspace_body.grid(row=4, column=0, sticky="nsew")
-        self.workspace_body.grid_columnconfigure(0, weight=1)
-        self.workspace_body.grid_rowconfigure(0, weight=1)
-
-        self._build_manage_mods_tab()
-        self._build_search_mods_tab()
-
-        # 6. Dedicated Footer Status Bar
-        self.status_bar_frame = ctk.CTkFrame(
-            self.main_panel,
-            fg_color=THEME["bg_sidebar"],
-            corner_radius=8,
-            height=32
-        )
-        self.status_bar_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
-        self.status_bar_frame.grid_propagate(False)
-        self.status_bar_frame.grid_columnconfigure(0, weight=1)
-
-        self.status_lbl = ctk.CTkLabel(
-            self.status_bar_frame,
-            text="Ready.",
-            font=ctk.CTkFont(size=12),
-            text_color=THEME["text_muted"],
-            anchor="w"
-        )
-        self.status_lbl.grid(row=0, column=0, padx=12, pady=4, sticky="ew")
-
-    def _build_manage_mods_tab(self):
-        """Builds the Drag & Drop Installer + Installed Mods List view."""
-        self.manage_tab_frame = ctk.CTkFrame(self.workspace_body, fg_color="transparent")
-        self.manage_tab_frame.grid(row=0, column=0, sticky="nsew")
-        self.manage_tab_frame.grid_columnconfigure(0, weight=1)
-        self.manage_tab_frame.grid_rowconfigure(1, weight=1)
-
-        # Drag & Drop Zone
+        # 4. Drag & Drop Zone (.zip / .rar / .7z) — Single Browse Button (No duplicate Mod Sites button)
         self.drop_zone = ctk.CTkFrame(
-            self.manage_tab_frame,
+            self.main_panel,
             fg_color=THEME["bg_card"],
             border_color=THEME["accent"],
             border_width=2,
             corner_radius=14,
             height=118
         )
-        self.drop_zone.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        self.drop_zone.grid(row=3, column=0, sticky="ew", pady=(0, 12))
         self.drop_zone.grid_propagate(False)
         self.drop_zone.grid_columnconfigure(0, weight=1)
         self.drop_zone.grid_rowconfigure(0, weight=1)
@@ -3064,30 +3379,16 @@ class NebulaModManagerApp(BaseWindowClass):
         )
         self.drop_title.pack(pady=(6, 4))
 
-        drop_btn_row = ctk.CTkFrame(drop_inner, fg_color="transparent")
-        drop_btn_row.pack(pady=(2, 6))
-
         self.browse_btn = ctk.CTkButton(
-            drop_btn_row,
+            drop_inner,
             text="📁 Browse Local Archive (.zip / .rar / .7z)",
             fg_color=THEME["accent"],
             hover_color=THEME["accent_hover"],
-            height=30,
+            height=32,
             command=self._browse_archive_dialog,
             state="disabled"
         )
-        self.browse_btn.pack(side="left", padx=6)
-
-        self.drop_sites_btn = ctk.CTkButton(
-            drop_btn_row,
-            text="🔍 Switch to Mod Search Tab",
-            fg_color=THEME["sites_bg"],
-            hover_color=THEME["sites_hover"],
-            height=30,
-            command=lambda: self._switch_to_tab("🔍 Search Mods Online"),
-            state="disabled"
-        )
-        self.drop_sites_btn.pack(side="left", padx=6)
+        self.browse_btn.pack(pady=(2, 6))
 
         self.drop_zone.bind("<Enter>", lambda e: self.drop_zone.configure(border_color="#c084fc", fg_color="#251c42"))
         self.drop_zone.bind("<Leave>", lambda e: self.drop_zone.configure(border_color=THEME["accent"], fg_color=THEME["bg_card"]))
@@ -3096,15 +3397,15 @@ class NebulaModManagerApp(BaseWindowClass):
             self.drop_zone.drop_target_register(DND_FILES)
             self.drop_zone.dnd_bind("<<Drop>>", self._on_file_dropped)
 
-        # Installed Mods List Container
-        mods_container = ctk.CTkFrame(self.manage_tab_frame, fg_color=THEME["bg_card"], corner_radius=12)
-        mods_container.grid(row=1, column=0, sticky="nsew")
+        # 5. Installed Mods Container (With Search Bar for Installed Mods)
+        mods_container = ctk.CTkFrame(self.main_panel, fg_color=THEME["bg_card"], corner_radius=12)
+        mods_container.grid(row=4, column=0, sticky="nsew")
         mods_container.grid_columnconfigure(0, weight=1)
         mods_container.grid_rowconfigure(1, weight=1)
 
         mods_header = ctk.CTkFrame(mods_container, fg_color="transparent")
         mods_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
-        mods_header.grid_columnconfigure(0, weight=1)
+        mods_header.grid_columnconfigure(1, weight=1)
 
         self.mods_header_lbl = ctk.CTkLabel(
             mods_header,
@@ -3112,10 +3413,21 @@ class NebulaModManagerApp(BaseWindowClass):
             font=ctk.CTkFont(size=16, weight="bold"),
             text_color=THEME["text_main"]
         )
-        self.mods_header_lbl.grid(row=0, column=0, sticky="w")
+        self.mods_header_lbl.grid(row=0, column=0, sticky="w", padx=(0, 12))
+
+        self.installed_mods_search_entry = ctk.CTkEntry(
+            mods_header,
+            placeholder_text="🔍 Search installed mods...",
+            fg_color=THEME["bg_sidebar"],
+            border_color=THEME["accent"],
+            text_color=THEME["text_main"],
+            height=30
+        )
+        self.installed_mods_search_entry.grid(row=0, column=1, sticky="ew", padx=(4, 12))
+        self.installed_mods_search_entry.bind("<KeyRelease>", lambda e: self._refresh_installed_mods_ui())
 
         bulk_btns_frame = ctk.CTkFrame(mods_header, fg_color="transparent")
-        bulk_btns_frame.grid(row=0, column=1, sticky="e")
+        bulk_btns_frame.grid(row=0, column=2, sticky="e")
 
         self.enable_all_btn = ctk.CTkButton(
             bulk_btns_frame,
@@ -3148,229 +3460,55 @@ class NebulaModManagerApp(BaseWindowClass):
             fg_color="transparent",
             scrollbar_button_color=THEME["accent"]
         )
-        self.mods_list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 10))
+        self.mods_list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 6))
         self.mods_list_frame.grid_columnconfigure(0, weight=1)
 
-    def _build_search_mods_tab(self):
-        """Builds the in-app Online Mod Search tab."""
-        self.search_tab_frame = ctk.CTkFrame(self.workspace_body, fg_color=THEME["bg_card"], corner_radius=12)
-        self.search_tab_frame.grid_columnconfigure(0, weight=1)
-        self.search_tab_frame.grid_rowconfigure(2, weight=1)
-
-        # Search Controls Bar
-        top_bar = ctk.CTkFrame(self.search_tab_frame, fg_color="transparent")
-        top_bar.grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 8))
-        top_bar.grid_columnconfigure(0, weight=1)
-
-        self.mod_search_input = ctk.CTkEntry(
-            top_bar,
-            placeholder_text="Search mods for this game (e.g. weapons, graphics, map, overhaul, realism)...",
+        # Dedicated Footer Status Bar
+        self.status_bar_frame = ctk.CTkFrame(
+            mods_container,
             fg_color=THEME["bg_sidebar"],
-            border_color=THEME["accent"],
-            text_color=THEME["text_main"],
-            height=38
+            corner_radius=8,
+            height=32
         )
-        self.mod_search_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.mod_search_input.bind("<Return>", lambda e: self._run_online_mod_search())
+        self.status_bar_frame.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        self.status_bar_frame.grid_propagate(False)
+        self.status_bar_frame.grid_columnconfigure(0, weight=1)
 
-        self.mod_search_btn = ctk.CTkButton(
-            top_bar,
-            text="🔍 Search Mods",
-            fg_color=THEME["accent"],
-            hover_color=THEME["accent_hover"],
-            font=ctk.CTkFont(size=13, weight="bold"),
-            width=145,
-            height=38,
-            command=self._run_online_mod_search
+        self.status_lbl = ctk.CTkLabel(
+            self.status_bar_frame,
+            text="Ready.",
+            font=ctk.CTkFont(size=12),
+            text_color=THEME["text_muted"],
+            anchor="w"
         )
-        self.mod_search_btn.grid(row=0, column=1)
+        self.status_lbl.grid(row=0, column=0, padx=12, pady=4, sticky="ew")
 
-        # Filter Pills Row
-        filter_row = ctk.CTkFrame(self.search_tab_frame, fg_color="transparent")
-        filter_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 8))
-
-        ctk.CTkLabel(
-            filter_row,
-            text="Source Filter:",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color=THEME["text_muted"]
-        ).pack(side="left", padx=(0, 8))
-
-        self.search_source_filter = ctk.CTkSegmentedButton(
-            filter_row,
-            values=["All Sites", "Nexus Mods", "Mod.io", "Thunderstore", "GameBanana", "Steam Workshop"],
-            selected_color=THEME["accent"],
-            selected_hover_color=THEME["accent_hover"],
-            unselected_color=THEME["bg_sidebar"],
-            unselected_hover_color=THEME["bg_card_hover"],
-            height=28,
-            command=lambda val: self._run_online_mod_search()
+    # ==========================================
+    # GITHUB BUG REPORT & AUTO-UPDATE HANDLERS
+    # ==========================================
+    def _open_github_bug_report(self):
+        game_info = (
+            f"{self.selected_game['name']} (AppID: {self.selected_game['appid']})"
+            if self.selected_game
+            else "Specify Game Name"
         )
-        self.search_source_filter.set("All Sites")
-        self.search_source_filter.pack(side="left")
+        mod_path_info = str(self.current_mod_target_dir or "Default")
 
-        # Results Scrollable Frame
-        self.search_results_scroll = ctk.CTkScrollableFrame(
-            self.search_tab_frame,
-            fg_color="transparent",
-            scrollbar_button_color=THEME["accent"]
+        issue_title = quote_plus(f"[BUG] {self.selected_game['name'] if self.selected_game else 'Issue Report'}: ")
+        issue_body = quote_plus(
+            f"### Game Name & Steam AppID\n{game_info}\n\n"
+            f"### Detected Mod Install Path\n`{mod_path_info}`\n\n"
+            f"### Link to the Mod (Nexus Mods / Mod.io / etc.)\nPaste link here:\n\n"
+            f"### What Happened?\nDescribe what happened when installing the mod or loader:\n"
         )
-        self.search_results_scroll.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self.search_results_scroll.grid_columnconfigure(0, weight=1)
+        bug_url = f"{GITHUB_REPO_URL}/issues/new?title={issue_title}&body={issue_body}"
+        webbrowser.open(bug_url)
 
-    def _switch_to_tab(self, tab_name: str):
-        self.workspace_tab_switcher.set(tab_name)
-        self._on_workspace_tab_changed(tab_name)
-
-    def _on_workspace_tab_changed(self, tab_name: str):
-        self.active_workspace_tab = tab_name
-        if tab_name == "🔍 Search Mods Online":
-            self.manage_tab_frame.grid_forget()
-            self.search_tab_frame.grid(row=0, column=0, sticky="nsew")
-            self._run_online_mod_search()
-        else:
-            self.search_tab_frame.grid_forget()
-            self.manage_tab_frame.grid(row=0, column=0, sticky="nsew")
-
-    def _run_online_mod_search(self):
-        if not self.selected_game:
-            return
-
-        game = self.selected_game
-        query = self.mod_search_input.get().strip()
-        site_filter = self.search_source_filter.get()
-
-        for w in self.search_results_scroll.winfo_children():
-            w.destroy()
-
-        loading_lbl = ctk.CTkLabel(
-            self.search_results_scroll,
-            text=f"🔍 Searching {site_filter} for '{query or 'Popular Mods'}' in {game['name']}...",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color=THEME["text_muted"]
-        )
-        loading_lbl.grid(row=0, column=0, pady=40)
-        self.status_lbl.configure(text=f"Searching online mods for {game['name']}...")
-
+    def _check_github_updates_async(self):
         def worker():
-            results = OnlineModSearchEngine.search_mods(game, query, site_filter)
-            self.after(0, lambda: self._render_mod_search_results(game, results))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _render_mod_search_results(self, game: dict, results: list[dict]):
-        if not self.selected_game or str(self.selected_game["appid"]) != str(game["appid"]):
-            return
-
-        for w in self.search_results_scroll.winfo_children():
-            w.destroy()
-
-        if not results:
-            ctk.CTkLabel(
-                self.search_results_scroll,
-                text="No mods found matching that search. Try another keyword or click 'Mod Sites' above!",
-                font=ctk.CTkFont(size=13),
-                text_color=THEME["text_muted"]
-            ).grid(row=0, column=0, pady=40)
-            return
-
-        self.status_lbl.configure(text=f"Found {len(results)} mod result(s) for {game['name']}.")
-
-        for idx, item in enumerate(results):
-            card = ctk.CTkFrame(
-                self.search_results_scroll,
-                fg_color=THEME["bg_sidebar"],
-                corner_radius=10
-            )
-            card.grid(row=idx, column=0, sticky="ew", padx=4, pady=5)
-            card.grid_columnconfigure(0, weight=1)
-
-            left_box = ctk.CTkFrame(card, fg_color="transparent")
-            left_box.grid(row=0, column=0, padx=14, pady=10, sticky="ew")
-
-            title_row = ctk.CTkFrame(left_box, fg_color="transparent")
-            title_row.pack(fill="x", anchor="w")
-
-            site_badge = ctk.CTkLabel(
-                title_row,
-                text=item["site"],
-                font=ctk.CTkFont(size=11, weight="bold"),
-                fg_color=THEME["accent_hover"],
-                text_color=THEME["text_main"],
-                corner_radius=6,
-                padx=8,
-                pady=2
-            )
-            site_badge.pack(side="left", padx=(0, 8))
-
-            ctk.CTkLabel(
-                title_row,
-                text=item["title"],
-                font=ctk.CTkFont(size=14, weight="bold"),
-                text_color=THEME["text_main"],
-                anchor="w"
-            ).pack(side="left")
-
-            ctk.CTkLabel(
-                left_box,
-                text=item["desc"],
-                font=ctk.CTkFont(size=12),
-                text_color=THEME["text_muted"],
-                anchor="w",
-                justify="left",
-                wraplength=640
-            ).pack(fill="x", pady=(4, 0), anchor="w")
-
-            btn_box = ctk.CTkFrame(card, fg_color="transparent")
-            btn_box.grid(row=0, column=1, padx=12, pady=10, sticky="e")
-
-            if item.get("direct_download_url"):
-                dl_btn = ctk.CTkButton(
-                    btn_box,
-                    text="⚡ 1-Click Install",
-                    fg_color=THEME["play_bg"],
-                    hover_color=THEME["play_hover"],
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                    width=130,
-                    height=30,
-                    command=lambda it=item: self._download_and_install_search_mod(it)
-                )
-                dl_btn.pack(side="left", padx=(0, 6))
-
-            open_btn = ctk.CTkButton(
-                btn_box,
-                text="🌐 Open Mod Page ↗",
-                fg_color=THEME["accent"],
-                hover_color=THEME["accent_hover"],
-                font=ctk.CTkFont(size=12, weight="bold"),
-                width=145,
-                height=30,
-                command=lambda u=item["page_url"]: webbrowser.open(u)
-            )
-            open_btn.pack(side="left")
-
-    def _download_and_install_search_mod(self, mod_item: dict):
-        """Downloads a direct mod package from the Search tab and auto-installs it into the current game."""
-        if not self.selected_game or not mod_item.get("direct_download_url"):
-            return
-
-        url = mod_item["direct_download_url"]
-        filename = re.sub(r"[^a-zA-Z0-9_.\-]", "_", mod_item.get("archive_filename", "downloaded_mod.zip"))
-        temp_dl_path = CACHE_DIR / filename
-
-        self.status_lbl.configure(text=f"⬇️ Downloading '{mod_item['title']}'...")
-
-        def worker():
-            try:
-                with requests.get(url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    with open(temp_dl_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            if chunk:
-                                f.write(chunk)
-                self.after(0, lambda: self._install_archive(str(temp_dl_path)))
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Download Failed", str(e)))
+            update_info = AppAutoUpdater.check_for_updates()
+            if update_info:
+                self.after(200, lambda: UpdatePromptDialog(self, update_info))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -3411,7 +3549,7 @@ class NebulaModManagerApp(BaseWindowClass):
 
         self.welcome_sub_lbl = ctk.CTkLabel(
             center_card,
-            text="Fast-scanning Steam libraries...",
+            text="Fast-scanning Steam libraries & checking for updates...",
             font=ctk.CTkFont(size=13),
             text_color=THEME["text_muted"]
         )
@@ -3476,6 +3614,7 @@ class NebulaModManagerApp(BaseWindowClass):
     def _slide_out_welcome_screen(self, offset_y: float):
         if offset_y <= -1.0:
             self.welcome_frame.place_forget()
+            self._check_github_updates_async()
             return
         next_y = offset_y - 0.12
         self.welcome_frame.place(relx=0.0, rely=next_y, relwidth=1.0, relheight=1.0)
@@ -3506,7 +3645,6 @@ class NebulaModManagerApp(BaseWindowClass):
         if self.games and not self.selected_game:
             self._select_game(self.games[0])
 
-        # Render game cards in non-blocking batches of 12 so the UI stays 100% responsive!
         self._render_game_cards_batch(0, batch_size=12)
 
     def _render_game_cards_batch(self, start_idx: int, batch_size: int = 12):
@@ -3728,8 +3866,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self.game_title_lbl.configure(text=game["name"])
         self.game_path_lbl.configure(text=f"Steam Folder: {game['install_dir']}")
         self.play_game_btn.configure(state="normal")
-        self.mod_sites_btn.configure(state="normal")
-        self.drop_sites_btn.configure(state="normal")
+        self.mod_sites_btn.configure(text="🌐  Mod Sites", state="normal")
         self.open_folder_btn.configure(state="normal")
         self.change_target_btn.configure(state="normal")
         self.browse_btn.configure(state="normal")
@@ -3745,7 +3882,6 @@ class NebulaModManagerApp(BaseWindowClass):
         else:
             self.banner_img_lbl.configure(image=self.placeholder_banner_ctk, text="")
 
-        # Show cached anti-cheat status immediately if known, else verify in background
         if game.get("has_anticheat_or_mp") is True:
             self._show_anticheat_warning(True)
         else:
@@ -3758,8 +3894,6 @@ class NebulaModManagerApp(BaseWindowClass):
         ).start()
 
         self._refresh_installed_mods_ui()
-        if self.active_workspace_tab == "🔍 Search Mods Online":
-            self._run_online_mod_search()
 
     def _animate_game_switch_transition(self, prev_appid: str | None, new_appid: str, step: int):
         if self._header_anim_job is not None:
@@ -3803,14 +3937,22 @@ class NebulaModManagerApp(BaseWindowClass):
         ModSitesDialog(self, self.selected_game)
 
     def _open_rottr_loader_gui_click(self):
+        """Pre-configures Rise of the Tomb Raider's path & registry before opening RottrModManager.exe."""
         if not self.selected_game:
             return
         game_root = Path(self.selected_game["install_dir"])
+        appid = str(self.selected_game["appid"])
+
+        # Ensure Registry + Steam Junction are set so RottrModManager never shows the path error!
+        ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
+
         exe = ModLoaderAutoInstaller.get_rottr_manager_exe(game_root)
         if exe and exe.exists():
             try:
                 subprocess.Popen([str(exe)], cwd=str(exe.parent))
-                self.status_lbl.configure(text=f"🛠️ Opened {exe.name} GUI.")
+                self.status_lbl.configure(
+                    text=f"🛠️ Opened {exe.name} (Game path pre-configured automatically)."
+                )
             except Exception as e:
                 messagebox.showerror("Error", f"Could not launch {exe.name}:\n{str(e)}")
 
@@ -3828,9 +3970,17 @@ class NebulaModManagerApp(BaseWindowClass):
     def _resolve_game_online_worker(self, game: dict):
         metadata = SmartModRouter.resolve_full_game_metadata_online(game)
         is_mp = SteamScanner.check_anticheat_or_multiplayer_lazy(game)
-        self.after(0, lambda: self._apply_online_game_metadata(game, metadata, is_mp))
+        verified_sites = ModSiteVerifier.verify_sites_for_game(game)
+        game["verified_mod_sites"] = verified_sites
+        self.after(0, lambda: self._apply_online_game_metadata(game, metadata, is_mp, verified_sites))
 
-    def _apply_online_game_metadata(self, game: dict, metadata: dict, is_mp: bool):
+    def _apply_online_game_metadata(
+        self,
+        game: dict,
+        metadata: dict,
+        is_mp: bool,
+        verified_sites: list[dict]
+    ):
         self._update_sidebar_mod_badge(game["appid"])
         if not self.selected_game or str(self.selected_game["appid"]) != str(game["appid"]):
             return
@@ -3839,6 +3989,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self.mod_target_lbl.configure(
             text=f"🎯 Default Mod Path: {metadata['mod_path']}   [{metadata['reason']}]"
         )
+        self.mod_sites_btn.configure(text=f"🌐  Mod Sites ({len(verified_sites)})")
         self._show_anticheat_warning(is_mp)
         self._show_loader_notice(
             metadata.get("loader_notice"),
@@ -4067,7 +4218,7 @@ class NebulaModManagerApp(BaseWindowClass):
         if inspection.get("requires_loader") and not self.current_loader_installed:
             dialog = ModLoaderRequiredDialog(
                 parent=self,
-                mod_name=Path(archive_path).name,
+                mod_name=format_simple_mod_name(Path(archive_path).stem, staging_dir),
                 mod_type=inspection.get("mod_type_label", "Mod Loader Mod"),
                 loader_name=inspection.get("loader_name") or self.current_loader_name or "Game Mod Loader",
                 target_dir=inspection["target_dir"]
@@ -4112,6 +4263,24 @@ class NebulaModManagerApp(BaseWindowClass):
         if not success:
             messagebox.showerror("Mod Installation Failed", msg)
 
+    def _rename_mod_click(self, mod: dict):
+        if not self.selected_game:
+            return
+        current_name = format_simple_mod_name(mod.get("name", ""))
+        dialog = ctk.CTkInputDialog(
+            text=f"Enter a new display name for '{current_name}':",
+            title="Rename Mod"
+        )
+        new_name = dialog.get_input()
+        if new_name and new_name.strip():
+            self.mod_controller.rename_mod(
+                str(self.selected_game["appid"]),
+                mod["id"],
+                new_name.strip()
+            )
+            self.status_lbl.configure(text=f"✏️ Renamed mod to '{new_name.strip()}'.")
+            self._refresh_installed_mods_ui()
+
     def _toggle_mod_click(self, mod_id: str):
         if not self.selected_game:
             return
@@ -4150,14 +4319,14 @@ class NebulaModManagerApp(BaseWindowClass):
             return
 
         appid = str(self.selected_game["appid"])
-        mods = self.mod_controller.get_mods_for_game(appid)
+        all_mods = self.mod_controller.get_mods_for_game(appid)
         loaded_count = self.mod_controller.get_enabled_mod_count(appid)
 
         self.mods_header_lbl.configure(
-            text=f"Installed Mods  •  {loaded_count} Loaded / {len(mods)} Total"
+            text=f"Installed Mods  •  {loaded_count} Loaded / {len(all_mods)} Total"
         )
 
-        if not mods:
+        if not all_mods:
             self.enable_all_btn.configure(state="disabled")
             self.disable_all_btn.configure(state="disabled")
             empty_lbl = ctk.CTkLabel(
@@ -4169,10 +4338,28 @@ class NebulaModManagerApp(BaseWindowClass):
             empty_lbl.grid(row=0, column=0, pady=36)
             return
 
-        self.enable_all_btn.configure(state="normal" if loaded_count < len(mods) else "disabled")
+        self.enable_all_btn.configure(state="normal" if loaded_count < len(all_mods) else "disabled")
         self.disable_all_btn.configure(state="normal" if loaded_count > 0 else "disabled")
 
-        for idx, mod in enumerate(mods):
+        mod_query = self.installed_mods_search_entry.get().strip().lower()
+        filtered_mods = [
+            m for m in all_mods
+            if not mod_query
+            or mod_query in format_simple_mod_name(m.get("name", "")).lower()
+            or mod_query in m.get("name", "").lower()
+        ]
+
+        if not filtered_mods:
+            no_match_lbl = ctk.CTkLabel(
+                self.mods_list_frame,
+                text=f"No installed mods match '{mod_query}'.",
+                font=ctk.CTkFont(size=13),
+                text_color=THEME["text_muted"]
+            )
+            no_match_lbl.grid(row=0, column=0, pady=36)
+            return
+
+        for idx, mod in enumerate(filtered_mods):
             is_enabled = mod.get("enabled", True)
             row = ctk.CTkFrame(
                 self.mods_list_frame,
@@ -4182,20 +4369,33 @@ class NebulaModManagerApp(BaseWindowClass):
             row.grid(row=idx, column=0, sticky="ew", pady=5, padx=4)
             row.grid_columnconfigure(0, weight=1)
 
-            subpath = mod.get("target_subpath", "Mod Folder")
-            mod_type_tag = mod.get("mod_type", "Mod")
-            status_tag = "🟢 ACTIVE" if is_enabled else "⏸️ DISABLED (In Vault)"
-            info_text = (
-                f"{status_tag}  |  🧩 {mod['name']}  •  🏷️ {mod_type_tag}  •  "
-                f"📁 {subpath} ({len(mod.get('files', []))} file(s))"
+            # Show clean, simple mod name
+            display_name = (
+                mod["name"]
+                if mod.get("custom_named")
+                else format_simple_mod_name(mod.get("name", ""))
             )
+            status_dot = "🟢" if is_enabled else "⏸️"
+            state_suffix = "" if is_enabled else "  (Disabled)"
+
             ctk.CTkLabel(
                 row,
-                text=info_text,
-                font=ctk.CTkFont(size=13, weight="bold"),
+                text=f"{status_dot}   {display_name}{state_suffix}",
+                font=ctk.CTkFont(size=14, weight="bold"),
                 text_color=THEME["text_main"] if is_enabled else THEME["text_muted"],
                 anchor="w"
             ).grid(row=0, column=0, padx=14, pady=12, sticky="ew")
+
+            rename_btn = ctk.CTkButton(
+                row,
+                text="✏️ Rename",
+                fg_color=THEME["bg_card"],
+                hover_color=THEME["bg_card_hover"],
+                width=90,
+                height=30,
+                command=lambda m=mod: self._rename_mod_click(m)
+            )
+            rename_btn.grid(row=0, column=1, padx=(6, 6), pady=10)
 
             toggle_btn = ctk.CTkButton(
                 row,
@@ -4206,7 +4406,7 @@ class NebulaModManagerApp(BaseWindowClass):
                 height=30,
                 command=lambda m_id=mod["id"]: self._toggle_mod_click(m_id)
             )
-            toggle_btn.grid(row=0, column=1, padx=(8, 6), pady=10)
+            toggle_btn.grid(row=0, column=2, padx=(0, 6), pady=10)
 
             remove_btn = ctk.CTkButton(
                 row,
@@ -4217,7 +4417,7 @@ class NebulaModManagerApp(BaseWindowClass):
                 height=30,
                 command=lambda m_id=mod["id"]: self._uninstall_mod_click(m_id)
             )
-            remove_btn.grid(row=0, column=2, padx=(0, 12), pady=10)
+            remove_btn.grid(row=0, column=3, padx=(0, 12), pady=10)
 
     def _open_mod_folder(self):
         target = self.current_mod_target_dir or (
