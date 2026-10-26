@@ -3,3 +3,4 @@ dist/
 Output/
 __pycache__/
 *.spec
+update_project.bat
