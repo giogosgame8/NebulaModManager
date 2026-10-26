@@ -1,0 +1,7 @@
+customtkinter
+tkinterdnd2
+pillow
+requests
+patool
+py7zr
+pyinstaller
