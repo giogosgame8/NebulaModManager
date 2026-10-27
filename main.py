@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 # APP VERSION & GITHUB REPOSITORY CONFIG
 # ==========================================
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_OWNER = "giogosgame8"
 GITHUB_REPO = "NebulaModManager"
 GITHUB_REPO_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
@@ -79,6 +79,7 @@ THEME = {
 }
 
 APP_DATA_DIR = Path(os.getenv("APPDATA", ".")) / "NebulaModManager"
+LOCALLOW_APP_DATA_DIR = Path.home() / "AppData" / "LocalLow"
 CACHE_DIR = APP_DATA_DIR / "cache"
 DISABLED_MODS_DIR = APP_DATA_DIR / "disabled_mods"
 VANILLA_BACKUP_DIR = APP_DATA_DIR / "vanilla_backups"
@@ -86,9 +87,10 @@ ROTTR_ARCHIVES_DIR = APP_DATA_DIR / "rottr_archives"
 MANIFEST_FILE = APP_DATA_DIR / "installed_mods.json"
 LOADER_MANIFEST_FILE = APP_DATA_DIR / "installed_loaders.json"
 CUSTOM_PATHS_FILE = APP_DATA_DIR / "custom_mod_paths_v2.json"
-ONLINE_CACHE_FILE = CACHE_DIR / "online_game_metadata_v7.json"
-VERIFIED_SITES_CACHE_FILE = CACHE_DIR / "verified_mod_sites_v2.json"
+ONLINE_CACHE_FILE = CACHE_DIR / "online_game_metadata_v8.json"
+VERIFIED_SITES_CACHE_FILE = CACHE_DIR / "verified_mod_sites_v3.json"
 NEXUS_GAMES_CACHE_FILE = CACHE_DIR / "nexus_games_list.json"
+INSTALLED_VERSION_FILE = APP_DATA_DIR / "installed_version.txt"
 ICON_PATH = APP_DATA_DIR / "nebula_icon.ico"
 
 for folder in (APP_DATA_DIR, CACHE_DIR, DISABLED_MODS_DIR, VANILLA_BACKUP_DIR, ROTTR_ARCHIVES_DIR):
@@ -161,11 +163,30 @@ def ensure_app_icon() -> Path:
 
 def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> str:
     """
-    Converts messy archive names (like 'No_Mercy_Menu-4299-1-0-1712345678' or 'a4-s4-b8-1-8')
-    into clean, human-readable mod titles, checking internal mod metadata files first.
+    Converts messy archive names into clean, human-readable mod titles,
+    checking BONELAB *.pallet.json and standard manifest.json / info.json files first.
     """
-    # 1. Check if the archive contains a manifest.json / info.json with a clean title
     if staging_dir and staging_dir.exists():
+        # 1. Check BONELAB *.pallet.json for the official mod title
+        for pallet_file in staging_dir.rglob("*.pallet.json"):
+            try:
+                pdata = json.loads(pallet_file.read_text(encoding="utf-8-sig", errors="ignore"))
+                objects = pdata.get("objects", {})
+                if isinstance(objects, dict):
+                    for obj in objects.values():
+                        if isinstance(obj, dict) and obj.get("isa") == "pallet" and obj.get("title"):
+                            return str(obj["title"]).strip()
+                if pdata.get("title"):
+                    return str(pdata["title"]).strip()
+            except Exception:
+                pass
+            # Fallback to the pallet filename without '.pallet.json' (e.g. Fishstick5334.Bonecraft -> Bonecraft)
+            stem_part = pallet_file.name[:-len(".pallet.json")]
+            if "." in stem_part:
+                return stem_part.split(".", 1)[1].replace("_", " ").strip()
+            return stem_part
+
+        # 2. Check standard manifest.json / info.json / mod.json
         for meta_file in ("manifest.json", "info.json", "mod.json"):
             for found in staging_dir.rglob(meta_file):
                 try:
@@ -176,7 +197,6 @@ def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> st
                 except Exception:
                     pass
 
-        # If the archive has a single top-level descriptive folder, prefer its name if raw_name looks cryptic
         top_dirs = [d for d in staging_dir.iterdir() if d.is_dir()]
         if len(top_dirs) == 1:
             folder_name = top_dirs[0].name
@@ -189,14 +209,15 @@ def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> st
 
     name = Path(raw_name).stem if raw_name.lower().endswith((".zip", ".rar", ".7z")) else raw_name
 
-    # 2. Strip Nexus Mods trailing pattern: -<ModID>-<Version...>-<UnixTimestamp>
+    # If it's an Author.ModName format (like Fishstick5334.Bonecraft), show clean ModName
+    if re.match(r"^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$", name):
+        name = name.split(".", 1)[1]
+
+    # Strip Nexus Mods trailing pattern: -<ModID>-<Version...>-<UnixTimestamp>
     name = re.sub(r"-\d+\s*(?:-[0-9a-zA-Z_.]+\s*)+-\d{9,11}$", "", name)
-    # Strip trailing Nexus ModID + version if ends with -<4+ digits>-<version>
     name = re.sub(r"-\d{3,7}-\d+(?:-\d+)+$", "", name)
-    # Strip common trailing version tags like _v1.2.3 or -v1.0
     name = re.sub(r"[\s_\-]+[vV]?\d+\.\d+(?:\.\d+)*$", "", name)
 
-    # 3. Replace underscores and dashes with spaces
     name = name.replace("_", " ").replace("-", " ")
     name = re.sub(r"\s+", " ", name).strip()
 
@@ -206,13 +227,9 @@ def format_simple_mod_name(raw_name: str, staging_dir: Path | None = None) -> st
 # ==========================================
 # AUTOMATIC GITHUB UPDATE CHECKER & INSTALLER
 # ==========================================
-INSTALLED_VERSION_FILE = APP_DATA_DIR / "installed_version.txt"
-
-
 class AppAutoUpdater:
     @staticmethod
     def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
-        """Extracts semantic version numbers (e.g. 'v1.0.1' -> (1, 0, 1))."""
         match = re.search(r"(\d+(?:\.\d+)+)", ver_str)
         if match:
             return tuple(int(n) for n in match.group(1).split("."))
@@ -221,10 +238,6 @@ class AppAutoUpdater:
 
     @classmethod
     def get_current_effective_version(cls) -> tuple[str, tuple[int, ...]]:
-        """
-        Returns the highest version between APP_VERSION in code and the last
-        auto-installed GitHub tag stored in AppData (prevents infinite update loops).
-        """
         code_tuple = cls._parse_version_tuple(APP_VERSION)
         if INSTALLED_VERSION_FILE.exists():
             try:
@@ -262,7 +275,6 @@ class AppAutoUpdater:
             current_tag, local_ver = cls.get_current_effective_version()
             remote_ver = cls._parse_version_tuple(tag_name)
 
-            # Already on this exact tag or a newer/equal version -> Do NOT prompt!
             if tag_name.lower() == current_tag.lower() or remote_ver <= local_ver:
                 return None
 
@@ -318,10 +330,8 @@ class AppAutoUpdater:
                                     progress_callback(0.5, f"Downloading update: {mb_d:.1f} MB...")
 
                 progress_callback(1.0, "Launching installer...")
-                # Record the new tag immediately so it never loops even if APP_VERSION wasn't bumped
                 cls.record_installed_version(tag_name)
 
-                # Launch the installer in a detached process so closing Nebula doesn't kill or crash it
                 subprocess.Popen(
                     f'cmd /c timeout /t 1 /nobreak >nul & start "" "{temp_setup_path}" /SILENT',
                     shell=True,
@@ -462,7 +472,6 @@ class UpdatePromptDialog(ctk.CTkToplevel):
 
     def _on_update_finished(self, ok: bool, msg: str):
         if ok:
-            # Exit process cleanly with os._exit(0) so PyInstaller never throws a SystemExit crash popup
             os._exit(0)
         else:
             messagebox.showinfo("Update Info", msg)
@@ -484,6 +493,8 @@ NEXUS_FALLBACK_SLUGS = {
     "220": "halflife2",
     "550": "left4dead2",
     "4000": "garrysmod",
+    "1592190": "bonelab",
+    "823500": "boneworks",
     "1144200": "readyornot",
     "391220": "riseofthetombraider",
     "750920": "shadowofthetombraider",
@@ -513,8 +524,8 @@ NEXUS_FALLBACK_SLUGS = {
 }
 
 MODIO_KNOWN_SLUGS = {
+    "1592190": "bonelab",
     "1144200": "readyornot",
-    "2167580": "bonelab",
     "823500": "boneworks",
     "1086940": "baldursgate3",
     "1643320": "stalker2",
@@ -528,12 +539,6 @@ MODIO_KNOWN_SLUGS = {
 
 
 class ModSiteVerifier:
-    """
-    Checks each modding site (Nexus Mods, Thunderstore, Mod.io, CurseForge) for the selected game:
-      1. Resolves the exact game-specific URL so links never land on a generic homepage.
-      2. Verifies whether the game actually exists and has mods on that site.
-      3. Caches verified sites per AppID for instant loading.
-    """
     _nexus_domain_map = None
     _thunderstore_comm_map = None
 
@@ -559,7 +564,6 @@ class ModSiteVerifier:
 
     @classmethod
     def _ensure_nexus_games_map(cls) -> dict:
-        """Loads Nexus Mods' official games.json (name -> domain_name for games with mods > 0)."""
         if cls._nexus_domain_map is not None:
             return cls._nexus_domain_map
 
@@ -568,7 +572,6 @@ class ModSiteVerifier:
 
         if NEXUS_GAMES_CACHE_FILE.exists():
             try:
-                # Refresh cache if older than 7 days
                 age_days = (datetime.now().timestamp() - NEXUS_GAMES_CACHE_FILE.stat().st_mtime) / 86400
                 if age_days < 7:
                     raw_list = json.loads(NEXUS_GAMES_CACHE_FILE.read_text(encoding="utf-8"))
@@ -600,7 +603,6 @@ class ModSiteVerifier:
 
     @classmethod
     def _ensure_thunderstore_map(cls) -> dict:
-        """Loads Thunderstore's official community list (normalized_name -> identifier)."""
         if cls._thunderstore_comm_map is not None:
             return cls._thunderstore_comm_map
 
@@ -623,7 +625,6 @@ class ModSiteVerifier:
 
     @classmethod
     def verify_sites_for_game(cls, game: dict) -> list[dict]:
-        """Returns ONLY the mod sites that have a verified page and active mods for `game`."""
         appid = str(game["appid"])
         game_name = game["name"]
 
@@ -640,9 +641,7 @@ class ModSiteVerifier:
             )
         }
 
-        # ------------------------------------------------------------------
-        # 1. NEXUS MODS (Exact domain_name resolution + verification)
-        # ------------------------------------------------------------------
+        # 1. NEXUS MODS
         nexus_map = cls._ensure_nexus_games_map()
         nexus_domain = None
         nexus_mod_count = None
@@ -654,12 +653,10 @@ class ModSiteVerifier:
         elif norm_title in nexus_map:
             nexus_domain, nexus_mod_count = nexus_map[norm_title]
         else:
-            # Try stripping editions (e.g., "Game: Special Edition" -> "Game")
             base_title = cls._norm(re.split(r"[:\-–—]", game_name)[0])
             if base_title and base_title in nexus_map:
                 nexus_domain, nexus_mod_count = nexus_map[base_title]
             else:
-                # Probe direct domain slug on nexusmods.com
                 try:
                     probe_url = f"https://www.nexusmods.com/{norm_title}/mods/"
                     r = requests.get(probe_url, headers=headers, timeout=4, allow_redirects=True)
@@ -677,9 +674,7 @@ class ModSiteVerifier:
                 "url": f"https://www.nexusmods.com/{nexus_domain}/mods/"
             })
 
-        # ------------------------------------------------------------------
-        # 2. THUNDERSTORE (Only shown if game has a verified Thunderstore community)
-        # ------------------------------------------------------------------
+        # 2. THUNDERSTORE
         ts_map = cls._ensure_thunderstore_map()
         ts_slug = ts_map.get(norm_title)
         if not ts_slug:
@@ -697,12 +692,9 @@ class ModSiteVerifier:
                 "url": f"https://thunderstore.io/c/{ts_slug}/"
             })
 
-        # ------------------------------------------------------------------
-        # 3. MOD.IO (Only shown if the game actually exists on Mod.io!)
-        # ------------------------------------------------------------------
+        # 3. MOD.IO
         modio_slug = MODIO_KNOWN_SLUGS.get(appid)
         if not modio_slug:
-            # Probe Mod.io to see if a real game hub exists for this title
             hyphen_candidate = re.sub(r"[^a-z0-9]+", "-", game_name.lower()).strip("-")
             for candidate in dict.fromkeys([norm_title, hyphen_candidate]):
                 if not candidate:
@@ -726,9 +718,7 @@ class ModSiteVerifier:
                 "url": f"https://mod.io/g/{modio_slug}"
             })
 
-        # ------------------------------------------------------------------
-        # 4. CURSEFORGE (Only shown if the game has a verified CurseForge hub)
-        # ------------------------------------------------------------------
+        # 4. CURSEFORGE
         cf_hyphen = re.sub(r"[^a-z0-9]+", "-", game_name.lower()).strip("-")
         cf_verified_url = None
         for candidate in dict.fromkeys([cf_hyphen, norm_title]):
@@ -863,6 +853,13 @@ LOADER_CATALOG = {
 # KNOWN PROFILES & MOD LOADER DEFINITIONS
 # ==========================================
 KNOWN_GAME_PROFILES = {
+    "1592190": {  # BONELAB
+        "path_type": "locallow",
+        "rel_path": "Stress Level Zero/BONELAB/Mods",
+        "loader_id": None,
+        "loader_name": None,
+        "loader_check_files": []
+    },
     "284160": {   # BeamNG.drive
         "path_type": "beamng_repo",
         "rel_path": "BeamNG.drive/current/mods/repo",
@@ -1050,7 +1047,32 @@ class ArchiveModInspector:
         }
         exts_lower = {p.suffix.lower() for p in all_files}
 
-        # B. Check if user dropped a MOD LOADER archive itself
+        # B. BONELAB (AppID 1592190) or Marrow SDK Pallet Mods (*.pallet.json / *.bundle)
+        has_pallet_json = any(f.endswith(".pallet.json") for f in file_names_lower)
+        if appid == "1592190" or "bonelab" in game["name"].lower() or has_pallet_json:
+            bonelab_mods_dir = LOCALLOW_APP_DATA_DIR / "Stress Level Zero" / "BONELAB" / "Mods"
+            # If it's a MelonLoader code mod (.dll without .pallet.json or .bundle), route to Steam game Mods folder
+            if ".dll" in exts_lower and not has_pallet_json and ".bundle" not in exts_lower:
+                return {
+                    "is_loader_package": False,
+                    "requires_loader": True,
+                    "loader_id": "MelonLoader",
+                    "loader_name": "MelonLoader (Required for BONELAB Code Mods)",
+                    "target_dir": game_root / "Mods",
+                    "mod_type_label": "BONELAB Code Mod",
+                    "sub_mode": "unity_mod"
+                }
+            return {
+                "is_loader_package": False,
+                "requires_loader": False,
+                "loader_id": None,
+                "loader_name": None,
+                "target_dir": bonelab_mods_dir,
+                "mod_type_label": "BONELAB Mod",
+                "sub_mode": "bonelab_pallet"
+            }
+
+        # C. Check if user dropped a MOD LOADER archive itself
         if "trreboottools.modmanager.exe" in file_names_lower or "rottrmodmanager.exe" in file_names_lower:
             return {
                 "is_loader_package": True,
@@ -1082,7 +1104,7 @@ class ArchiveModInspector:
                 "reason": "Detected BepInEx core files inside archive"
             }
 
-        # C. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013
+        # D. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013
         if appid in {"391220", "750920", "203160"} or loader_id == "RottrModManager":
             return {
                 "is_loader_package": False,
@@ -1094,14 +1116,13 @@ class ArchiveModInspector:
                 "sub_mode": "rottr_direct_loader"
             }
 
-        # D. Unreal Engine 4/5 Games (Ready or Not, Palworld, Hogwarts Legacy, etc.)
+        # E. Unreal Engine 4/5 Games (Ready or Not, Palworld, Hogwarts Legacy, etc.)
         ue_paks_dir = SmartModRouter._find_unreal_paks_dir(game_root)
         if ue_paks_dir is not None or loader_id == "UE4SS":
             ue_content_dir = ue_paks_dir.parent if ue_paks_dir else default_mod_target_dir.parent
             ue_win64_dir = ModLoaderAutoInstaller._resolve_loader_destination(game_root, "ue_win64")
             paks_base = ue_paks_dir or default_mod_target_dir
 
-            # 1. Movie / Intro / Menu Video Mods -> <Project>/Content/Movies
             has_movie_files = bool(exts_lower & UE_MOVIE_EXTENSIONS) or "movies" in rel_parts_lower
             if has_movie_files and not (exts_lower & UE_PAK_EXTENSIONS):
                 movies_dir = ue_content_dir / "Movies"
@@ -1115,7 +1136,6 @@ class ArchiveModInspector:
                     "sub_mode": "ue_movies"
                 }
 
-            # 2. Audio / FMOD Bank Mods -> <Project>/Content/FMOD/Desktop
             has_audio_banks = bool(exts_lower & UE_AUDIO_EXTENSIONS) or "fmod" in rel_parts_lower
             if has_audio_banks and not (exts_lower & UE_PAK_EXTENSIONS):
                 fmod_dir = ue_content_dir / "FMOD" / "Desktop"
@@ -1131,7 +1151,6 @@ class ArchiveModInspector:
                     "sub_mode": "ue_fmod"
                 }
 
-            # 3. UE4SS Script / DLL Mods
             has_lua_script = ".lua" in exts_lower or ("scripts" in rel_parts_lower and "main.lua" in file_names_lower)
             has_ue4ss_folder = "ue4ss" in rel_parts_lower
             has_ue4ss_dll = ("dlls" in rel_parts_lower and "main.dll" in file_names_lower) or (
@@ -1150,7 +1169,6 @@ class ArchiveModInspector:
                     "sub_mode": "ue4ss_mod"
                 }
 
-            # 4. UE4SS Blueprint LogicMods
             if "logicmods" in rel_parts_lower:
                 logic_mods_dir = paks_base / "LogicMods"
                 return {
@@ -1163,7 +1181,6 @@ class ArchiveModInspector:
                     "sub_mode": "ue_logicmod"
                 }
 
-            # 5. Standard Native .pak / .utoc / .ucas Mod
             if exts_lower & UE_PAK_EXTENSIONS:
                 return {
                     "is_loader_package": False,
@@ -1175,7 +1192,7 @@ class ArchiveModInspector:
                     "sub_mode": "ue_pak"
                 }
 
-        # E. Unity Games (BepInEx / MelonLoader)
+        # F. Unity Games (BepInEx / MelonLoader)
         if loader_id in {"BepInEx", "MelonLoader"}:
             if "patchers" in rel_parts_lower and "bepinex" not in rel_parts_lower:
                 target = game_root / "BepInEx" / "patchers"
@@ -1194,7 +1211,7 @@ class ArchiveModInspector:
                 "sub_mode": "unity_mod"
             }
 
-        # F. Bethesda Creation Engine
+        # G. Bethesda Creation Engine
         if (game_root / "Data").exists():
             for se_folder, se_label in (("skse", "SKSE64"), ("f4se", "F4SE"), ("sfse", "SFSE"), ("nvse", "xNVSE")):
                 if se_folder in rel_parts_lower and ".dll" in exts_lower:
@@ -1274,14 +1291,6 @@ class ModLoaderAutoInstaller:
 
     @classmethod
     def configure_rottr_game_path(cls, game_root: Path, appid: str = "391220"):
-        """
-        Fixes the 'Could not automatically determine the Rise of the Tomb Raider installation folder' error
-        by automatically pre-populating:
-          1. All Registry keys referenced inside RottrModManager.exe / TrRebootTools.ModManager.exe
-          2. Steam's Uninstall Registry key (Steam App 391220 -> InstallLocation)
-          3. A zero-admin Windows Directory Junction at <DefaultSteamRoot>\\steamapps\\common\\Rise of the Tomb Raider
-             if the game is installed on a secondary drive (e.g. E:\\SteamLibrary).
-        """
         if sys.platform != "win32":
             return
 
@@ -1290,7 +1299,6 @@ class ModLoaderAutoInstaller:
         try:
             import winreg
 
-            # 1. Pre-populate Steam Uninstall Registry keys (checked by RottrModManager to locate the game)
             uninstall_subkeys = [
                 rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {appid}",
                 rf"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App {appid}",
@@ -1303,7 +1311,6 @@ class ModLoaderAutoInstaller:
                     except OSError:
                         continue
 
-            # 2. Pre-populate RottrModManager / TrRebootTools / Square Enix registry keys
             candidate_reg_keys = [
                 r"Software\RottrModManager",
                 r"Software\SottrModManager",
@@ -1313,7 +1320,6 @@ class ModLoaderAutoInstaller:
                 r"Software\Square Enix\Rise of the Tomb Raider",
             ]
 
-            # Also dynamically extract any Software\... registry paths embedded inside RottrModManager.exe
             rottr_exe = cls.get_rottr_manager_exe(game_root)
             if rottr_exe and rottr_exe.exists():
                 try:
@@ -1342,7 +1348,6 @@ class ModLoaderAutoInstaller:
         except Exception:
             pass
 
-        # 3. Create a Directory Junction at <SteamRoot>\steamapps\common\<GameFolderName> if on another drive
         try:
             steam_root = SteamScanner.get_steam_root()
             if steam_root and steam_root.exists():
@@ -1815,11 +1820,11 @@ class SmartModRouter:
         game_name = game["name"]
         game_root = Path(game["install_dir"])
 
-        # Automatically pre-configure ROTTR / Tomb Raider registry & junction so the loader never errors!
         if appid in {"391220", "750920", "203160"} or any(game_root.glob("*.tiger")):
             ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
 
         local_appdata = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        locallow_appdata = LOCALLOW_APP_DATA_DIR
         roaming_appdata = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming"))
         documents_dir = Path.home() / "Documents"
 
@@ -1837,6 +1842,9 @@ class SmartModRouter:
 
             if ptype == "beamng_repo":
                 resolved_path, reason = cls.resolve_beamng_mods_path(game_root)
+            elif ptype == "locallow":
+                resolved_path = locallow_appdata / Path(rel)
+                reason = "🌐 Official BONELAB AppData\\LocalLow Mods Path"
             elif ptype == "localappdata":
                 resolved_path = local_appdata / Path(rel)
             elif ptype == "appdata":
@@ -1866,6 +1874,7 @@ class SmartModRouter:
             game_root=game_root,
             online_info=online_info,
             local_appdata=local_appdata,
+            locallow_appdata=locallow_appdata,
             roaming_appdata=roaming_appdata,
             documents_dir=documents_dir
         )
@@ -1978,7 +1987,7 @@ class SmartModRouter:
                     wikitext = p_resp.get("parse", {}).get("wikitext", {}).get("*", "")
                     if wikitext:
                         raw_paths = re.findall(
-                            r"\{\{p\|(localappdata|appdata|userprofile\\documents|documents|game)\}\}[\\/]([^\n|<>{}\[\]]+)",
+                            r"\{\{p\|(locallow|localappdata|appdata|userprofile\\documents|documents|game)\}\}[\\/]([^\n|<>{}\[\]]+)",
                             wikitext,
                             flags=re.IGNORECASE
                         )
@@ -2008,10 +2017,12 @@ class SmartModRouter:
         game_root: Path,
         online_info: dict,
         local_appdata: Path,
+        locallow_appdata: Path,
         roaming_appdata: Path,
         documents_dir: Path
     ) -> tuple[Path, str]:
         token_map = {
+            "locallow": locallow_appdata,
             "localappdata": local_appdata,
             "appdata": roaming_appdata,
             "documents": documents_dir,
@@ -2026,18 +2037,18 @@ class SmartModRouter:
             cleaned_rel = re.sub(r"<[^>]+>", "", rel_str).strip("\\/")
             candidate_base = base_dir / Path(cleaned_rel)
             if candidate_base.exists() and candidate_base.is_dir():
-                for mod_folder_name in ("current/mods/repo", "mods/repo", "mods", "Mods", "mod", "addons", "Paks"):
+                for mod_folder_name in ("Mods", "mods", "current/mods/repo", "mods/repo", "mod", "addons", "Paks"):
                     mod_sub = candidate_base / mod_folder_name
                     if mod_sub.exists() and mod_sub.is_dir():
                         return mod_sub, f"🌐 Online PCGamingWiki Path ({mod_folder_name})"
 
         clean_title = re.sub(r"[:™®']", "", game_name).strip()
-        for s_root in (local_appdata, roaming_appdata, documents_dir / "My Games", documents_dir):
+        for s_root in (locallow_appdata, local_appdata, roaming_appdata, documents_dir / "My Games", documents_dir):
             if not s_root.exists():
                 continue
             direct_match = s_root / clean_title
             if direct_match.exists() and direct_match.is_dir():
-                for mod_sub_name in ("current/mods/repo", "mods/repo", "mods", "Mods", "mod"):
+                for mod_sub_name in ("Mods", "mods", "current/mods/repo", "mods/repo", "mod"):
                     if (direct_match / mod_sub_name).exists():
                         return direct_match / mod_sub_name, "🌐 Auto-Discovered in User AppData/Documents"
 
@@ -2146,7 +2157,63 @@ class SmartModRouter:
     ) -> list[str]:
         installed_paths = []
 
-        # 1. BeamNG.drive (NEVER extract .zip mods -> copy straight into .../current/mods/repo)
+        # ------------------------------------------------------------------
+        # 1. BONELAB (AppID 1592190 / sub_mode == "bonelab_pallet"):
+        #    Extracts directly into \AppData\LocalLow\Stress Level Zero\BONELAB\Mods\<Author.ModName>\
+        #    while preserving the Pallet folder, catalog_*.json, *.pallet.json, and all *.bundle subfolders!
+        # ------------------------------------------------------------------
+        if str(appid) == "1592190" or sub_mode == "bonelab_pallet":
+            mod_target_dir.mkdir(parents=True, exist_ok=True)
+
+            # Find all *.pallet.json files inside the extracted archive
+            pallet_files = list(staging_dir.rglob("*.pallet.json"))
+            if pallet_files:
+                for pallet_file in pallet_files:
+                    pallet_source_dir = pallet_file.parent
+                    # Determine the exact Author.ModName folder name (e.g. Fishstick5334.Bonecraft)
+                    if pallet_source_dir != staging_dir:
+                        pallet_folder_name = pallet_source_dir.name
+                    else:
+                        # If the mod author zipped the files loose without a top folder,
+                        # derive the folder name from <Author.ModName>.pallet.json
+                        pallet_folder_name = pallet_file.name[:-len(".pallet.json")].strip()
+                        if not pallet_folder_name:
+                            pallet_folder_name = archive_path.stem
+
+                    dest_pallet_root = mod_target_dir / pallet_folder_name
+                    dest_pallet_root.mkdir(parents=True, exist_ok=True)
+
+                    for item in pallet_source_dir.rglob("*"):
+                        if item.is_file():
+                            rel = item.relative_to(pallet_source_dir)
+                            dest_file = dest_pallet_root / rel
+                            dest_file.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(item, dest_file)
+                            installed_paths.append(str(dest_file))
+                return installed_paths
+
+            # Fallback if a BONELAB mod doesn't have a .pallet.json: keep its top-level folder intact inside Mods/
+            top_items = list(staging_dir.iterdir())
+            if len(top_items) == 1 and top_items[0].is_dir():
+                source_root = top_items[0]
+                dest_root = mod_target_dir / source_root.name
+            else:
+                source_root = staging_dir
+                dest_root = mod_target_dir / archive_path.stem
+
+            dest_root.mkdir(parents=True, exist_ok=True)
+            for item in source_root.rglob("*"):
+                if item.is_file():
+                    rel = item.relative_to(source_root)
+                    dest_file = dest_root / rel
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, dest_file)
+                    installed_paths.append(str(dest_file))
+            return installed_paths
+
+        # ------------------------------------------------------------------
+        # 2. BeamNG.drive (NEVER extract .zip mods -> copy straight into .../current/mods/repo)
+        # ------------------------------------------------------------------
         if str(appid) == "284160" or sub_mode == "beamng_repo_zip":
             mod_target_dir.mkdir(parents=True, exist_ok=True)
             ext = archive_path.suffix.lower()
@@ -2171,9 +2238,9 @@ class SmartModRouter:
                         zf.write(f_item, f_item.relative_to(staging_dir))
             return [str(dest_zip)]
 
-        # 2. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013:
-        #    Pre-configure the game path so RottrModManager NEVER shows the folder error,
-        #    then pass the archive directly into RottrModManager.exe!
+        # ------------------------------------------------------------------
+        # 3. Rise of the Tomb Raider / Shadow of the Tomb Raider / TR2013
+        # ------------------------------------------------------------------
         if str(appid) in {"391220", "750920", "203160"} or sub_mode == "rottr_direct_loader":
             ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
             rottr_exe = ModLoaderAutoInstaller.get_rottr_manager_exe(game_root)
@@ -2211,7 +2278,9 @@ class SmartModRouter:
 
             return installed_paths
 
-        # 3. Unreal Engine Video / Movie Mods (e.g., ReadyOrNot/Content/Movies)
+        # ------------------------------------------------------------------
+        # 4. Unreal Engine Video / Movie Mods (e.g., ReadyOrNot/Content/Movies)
+        # ------------------------------------------------------------------
         if sub_mode == "ue_movies":
             mod_target_dir.mkdir(parents=True, exist_ok=True)
             effective_root = staging_dir
@@ -2239,7 +2308,9 @@ class SmartModRouter:
                         installed_paths.append(str(dest))
             return installed_paths
 
-        # 4. Unreal Engine Audio / FMOD Mods (e.g., ReadyOrNot/Content/FMOD/Desktop)
+        # ------------------------------------------------------------------
+        # 5. Unreal Engine Audio / FMOD Mods (e.g., ReadyOrNot/Content/FMOD/Desktop)
+        # ------------------------------------------------------------------
         if sub_mode == "ue_fmod":
             mod_target_dir.mkdir(parents=True, exist_ok=True)
             for file_path in staging_dir.rglob("*"):
@@ -2257,7 +2328,9 @@ class SmartModRouter:
                         installed_paths.append(str(dest))
             return installed_paths
 
-        # 5. UE4SS Script / DLL Mods
+        # ------------------------------------------------------------------
+        # 6. UE4SS Script / DLL Mods
+        # ------------------------------------------------------------------
         if sub_mode == "ue4ss_mod":
             mod_target_dir.mkdir(parents=True, exist_ok=True)
             effective_root = staging_dir
@@ -2299,7 +2372,9 @@ class SmartModRouter:
 
             return installed_paths
 
-        # 6. General & Unreal Engine Pak / Blueprint LogicMods Routing
+        # ------------------------------------------------------------------
+        # 7. General & Unreal Engine Pak / Blueprint LogicMods Routing
+        # ------------------------------------------------------------------
         try:
             target_parts_lower = {p.lower() for p in mod_target_dir.relative_to(game_root).parts}
             is_inside_game_root = True
@@ -2550,6 +2625,20 @@ class ModController:
         return p if p.is_absolute() else (game_dir / p)
 
     @staticmethod
+    def _cleanup_empty_parent_dirs(file_path: Path, stop_at_dirs: set[Path]):
+        """Removes empty mod subfolders (such as empty BONELAB pallet folders) after disabling/uninstalling."""
+        parent = file_path.parent
+        while parent and parent.exists() and parent not in stop_at_dirs:
+            try:
+                if not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+                else:
+                    break
+            except Exception:
+                break
+
+    @staticmethod
     def _restore_vanilla_backup_if_exists(appid: str, game_dir: Path, stored_path: str) -> bool:
         p = Path(stored_path)
         if p.is_absolute():
@@ -2742,6 +2831,8 @@ class ModController:
             return False, "Mod entry not found."
 
         game_dir = Path(game["install_dir"])
+        bonelab_mods_dir = LOCALLOW_APP_DATA_DIR / "Stress Level Zero" / "BONELAB" / "Mods"
+        stop_dirs = {game_dir, bonelab_mods_dir}
         vault_dir = DISABLED_MODS_DIR / appid / mod_id
         currently_enabled = target_mod.get("enabled", True)
 
@@ -2756,6 +2847,7 @@ class ModController:
                         vault_file.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(active_path), str(vault_file))
                         self._restore_vanilla_backup_if_exists(appid, game_dir, stored_file)
+                        self._cleanup_empty_parent_dirs(active_path, stop_dirs)
                         moved_count += 1
 
                 target_mod["enabled"] = False
@@ -2806,6 +2898,8 @@ class ModController:
             return False, "Mod entry not found in manifest."
 
         game_dir = Path(game["install_dir"])
+        bonelab_mods_dir = LOCALLOW_APP_DATA_DIR / "Stress Level Zero" / "BONELAB" / "Mods"
+        stop_dirs = {game_dir, bonelab_mods_dir}
         vault_dir = DISABLED_MODS_DIR / appid / mod_id
 
         for stored_file in target_mod.get("files", []):
@@ -2814,6 +2908,7 @@ class ModController:
                 if full_path.exists() and full_path.is_file():
                     full_path.unlink()
                 self._restore_vanilla_backup_if_exists(appid, game_dir, stored_file)
+                self._cleanup_empty_parent_dirs(full_path, stop_dirs)
             except Exception:
                 continue
 
@@ -2829,11 +2924,6 @@ class ModController:
 # MOD WEBSITES HUB DIALOG (VERIFIED PER GAME)
 # ==========================================
 class ModSitesDialog(ctk.CTkToplevel):
-    """
-    Displays ONLY verified modding websites that actually have a hub/mods for the selected game,
-    linking directly to the game's exact URL on each site.
-    """
-
     def __init__(self, parent, game: dict):
         super().__init__(parent)
         self.game = game
@@ -2870,7 +2960,7 @@ class ModSitesDialog(ctk.CTkToplevel):
 
         self.scroll = ctk.CTkScrollableFrame(
             self,
-            fg_color="transparent",
+            fg_color=THEME["bg_root"],
             scrollbar_button_color=THEME["accent"]
         )
         self.scroll.pack(fill="both", expand=True, padx=12, pady=(0, 12))
@@ -2913,7 +3003,7 @@ class ModSitesDialog(ctk.CTkToplevel):
             row.grid(row=idx, column=0, sticky="ew", padx=4, pady=5)
             row.grid_columnconfigure(0, weight=1)
 
-            info_box = ctk.CTkFrame(row, fg_color="transparent")
+            info_box = ctk.CTkFrame(row, fg_color=THEME["bg_card"])
             info_box.grid(row=0, column=0, padx=14, pady=10, sticky="w")
 
             ctk.CTkLabel(
@@ -3107,6 +3197,33 @@ class NebulaModManagerApp(BaseWindowClass):
         self.welcome_frame.lift()
         self.after(20, self._start_welcome_boot_sequence)
 
+    def _attach_glitch_free_scroll(self, scrollable_frame: ctk.CTkScrollableFrame):
+        """
+        Eliminates the Windows Tkinter Canvas scrolling glitch where child game cards
+        turn invisible while dragging the scrollbar thumb by forcing synchronous
+        Win32 child window invalidation (RedrawWindow with RDW_ALLCHILDREN | RDW_UPDATENOW).
+        """
+        canvas = scrollable_frame._parent_canvas
+        scrollbar = scrollable_frame._scrollbar
+
+        def sync_yview(*args):
+            canvas.yview(*args)
+            canvas.update_idletasks()
+            if sys.platform == "win32":
+                try:
+                    # RDW_INVALIDATE (0x0001) | RDW_ALLCHILDREN (0x0080) | RDW_UPDATENOW (0x0100) = 0x0181
+                    ctypes.windll.user32.RedrawWindow(canvas.winfo_id(), None, None, 0x0181)
+                except Exception:
+                    pass
+
+        scrollbar.configure(command=sync_yview)
+        canvas.bind(
+            "<Configure>",
+            lambda e: ctypes.windll.user32.RedrawWindow(canvas.winfo_id(), None, None, 0x0181)
+            if sys.platform == "win32" else None,
+            add="+"
+        )
+
     def _build_layout(self):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -3118,7 +3235,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self.sidebar.grid_rowconfigure(3, weight=1)
         self.sidebar.grid_columnconfigure(0, weight=1)
 
-        title_row = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        title_row = ctk.CTkFrame(self.sidebar, fg_color=THEME["bg_sidebar"])
         title_row.grid(row=0, column=0, padx=18, pady=(20, 6), sticky="ew")
         title_row.grid_columnconfigure(0, weight=1)
 
@@ -3168,15 +3285,17 @@ class NebulaModManagerApp(BaseWindowClass):
         self.filter_segment.set("All Games")
         self.filter_segment.grid(row=2, column=0, padx=16, pady=(0, 8), sticky="ew")
 
+        # Solid fg_color=THEME["bg_sidebar"] + synchronous Win32 redraw prevents invisible cards while scrolling!
         self.games_scroll = ctk.CTkScrollableFrame(
             self.sidebar,
-            fg_color="transparent",
+            fg_color=THEME["bg_sidebar"],
             scrollbar_button_color=THEME["accent"]
         )
         self.games_scroll.grid(row=3, column=0, padx=10, pady=2, sticky="nsew")
         self.games_scroll.grid_columnconfigure(0, weight=1)
+        self._attach_glitch_free_scroll(self.games_scroll)
 
-        sidebar_footer = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        sidebar_footer = ctk.CTkFrame(self.sidebar, fg_color=THEME["bg_sidebar"])
         sidebar_footer.grid(row=4, column=0, padx=16, pady=12, sticky="ew")
         sidebar_footer.grid_columnconfigure(0, weight=1)
         sidebar_footer.grid_columnconfigure(1, weight=1)
@@ -3402,7 +3521,7 @@ class NebulaModManagerApp(BaseWindowClass):
         )
         self.delete_loader_btn.pack(side="left")
 
-        # 4. Drag & Drop Zone (.zip / .rar / .7z) — Single Browse Button (No duplicate Mod Sites button)
+        # 4. Drag & Drop Zone (.zip / .rar / .7z)
         self.drop_zone = ctk.CTkFrame(
             self.main_panel,
             fg_color=THEME["bg_card"],
@@ -3451,7 +3570,7 @@ class NebulaModManagerApp(BaseWindowClass):
         mods_container.grid_columnconfigure(0, weight=1)
         mods_container.grid_rowconfigure(1, weight=1)
 
-        mods_header = ctk.CTkFrame(mods_container, fg_color="transparent")
+        mods_header = ctk.CTkFrame(mods_container, fg_color=THEME["bg_card"])
         mods_header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 6))
         mods_header.grid_columnconfigure(1, weight=1)
 
@@ -3474,7 +3593,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self.installed_mods_search_entry.grid(row=0, column=1, sticky="ew", padx=(4, 12))
         self.installed_mods_search_entry.bind("<KeyRelease>", lambda e: self._refresh_installed_mods_ui())
 
-        bulk_btns_frame = ctk.CTkFrame(mods_header, fg_color="transparent")
+        bulk_btns_frame = ctk.CTkFrame(mods_header, fg_color=THEME["bg_card"])
         bulk_btns_frame.grid(row=0, column=2, sticky="e")
 
         self.enable_all_btn = ctk.CTkButton(
@@ -3505,11 +3624,12 @@ class NebulaModManagerApp(BaseWindowClass):
 
         self.mods_list_frame = ctk.CTkScrollableFrame(
             mods_container,
-            fg_color="transparent",
+            fg_color=THEME["bg_card"],
             scrollbar_button_color=THEME["accent"]
         )
         self.mods_list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 6))
         self.mods_list_frame.grid_columnconfigure(0, weight=1)
+        self._attach_glitch_free_scroll(self.mods_list_frame)
 
         # Dedicated Footer Status Bar
         self.status_bar_frame = ctk.CTkFrame(
@@ -3706,18 +3826,29 @@ class NebulaModManagerApp(BaseWindowClass):
 
     def _create_single_game_card(self, game: dict):
         appid = str(game["appid"])
-        is_selected = self.selected_game and str(self.selected_game["appid"]) == appid
+        is_selected = bool(self.selected_game and str(self.selected_game["appid"]) == appid)
+        card_bg = THEME["accent_hover"] if is_selected else THEME["bg_card"]
+
         card = ctk.CTkFrame(
             self.games_scroll,
-            fg_color=THEME["accent_hover"] if is_selected else THEME["bg_card"],
-            corner_radius=10,
+            fg_color=card_bg,
+            corner_radius=8,
             height=68
         )
         card.pack(fill="x", pady=4, padx=4, anchor="n")
         card.grid_columnconfigure(1, weight=1)
 
         initial_thumb = self.image_cache[appid][0] if appid in self.image_cache else self.placeholder_thumb_ctk
-        img_lbl = ctk.CTkLabel(card, text="", image=initial_thumb, width=92, height=44)
+        # Solid fg_color + corner_radius=0 on child labels prevents CustomTkinter canvas transparency glitches during scroll!
+        img_lbl = ctk.CTkLabel(
+            card,
+            text="",
+            image=initial_thumb,
+            fg_color=card_bg,
+            corner_radius=0,
+            width=92,
+            height=44
+        )
         img_lbl.grid(row=0, column=0, rowspan=2, padx=8, pady=8)
 
         name_lbl = ctk.CTkLabel(
@@ -3725,6 +3856,8 @@ class NebulaModManagerApp(BaseWindowClass):
             text=game["name"],
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color=THEME["text_main"],
+            fg_color=card_bg,
+            corner_radius=0,
             anchor="w",
             justify="left",
             wraplength=170
@@ -3737,6 +3870,8 @@ class NebulaModManagerApp(BaseWindowClass):
             text=badge_text,
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color=badge_color,
+            fg_color=card_bg,
+            corner_radius=0,
             anchor="w"
         )
         badge_lbl.grid(row=1, column=1, sticky="w", padx=(2, 8), pady=(0, 6))
@@ -3747,6 +3882,7 @@ class NebulaModManagerApp(BaseWindowClass):
         self.game_tab_widgets[appid] = {
             "card": card,
             "img": img_lbl,
+            "name": name_lbl,
             "badge": badge_lbl,
             "game_ref": game,
             "name_lower": game["name"].lower()
@@ -3754,6 +3890,16 @@ class NebulaModManagerApp(BaseWindowClass):
 
         if appid not in self.image_cache:
             self.cover_executor.submit(self._fetch_game_cover_async, appid, img_lbl)
+
+    def _set_game_card_bg(self, appid: str, bg_hex: str):
+        """Updates the card frame and its inner labels to a matching solid hex color for glitch-free scrolling."""
+        if appid in self.game_tab_widgets:
+            w = self.game_tab_widgets[appid]
+            if w["card"].winfo_exists():
+                w["card"].configure(fg_color=bg_hex)
+                w["img"].configure(fg_color=bg_hex)
+                w["name"].configure(fg_color=bg_hex)
+                w["badge"].configure(fg_color=bg_hex)
 
     def _get_badge_text_and_color(self, game: dict) -> tuple[str, str]:
         appid = str(game["appid"])
@@ -3824,6 +3970,7 @@ class NebulaModManagerApp(BaseWindowClass):
 
         try:
             self.games_scroll._parent_canvas.yview_moveto(0.0)
+            self.games_scroll._parent_canvas.update_idletasks()
         except Exception:
             pass
 
@@ -3904,10 +4051,9 @@ class NebulaModManagerApp(BaseWindowClass):
             text=f"Viewing {game['name']}  •  {loaded_count} active mod(s), {total_count} total installed."
         )
 
-        for gid, widgets in self.game_tab_widgets.items():
-            card = widgets["card"]
-            if card.winfo_exists() and gid != appid and gid != prev_appid:
-                card.configure(fg_color=THEME["bg_card"])
+        for gid in self.game_tab_widgets:
+            if gid != appid and gid != prev_appid:
+                self._set_game_card_bg(gid, THEME["bg_card"])
 
         self._animate_game_switch_transition(prev_appid, appid, step=0)
 
@@ -3954,18 +4100,12 @@ class NebulaModManagerApp(BaseWindowClass):
         t = step / total_steps
 
         if new_appid in self.game_tab_widgets:
-            new_card = self.game_tab_widgets[new_appid]["card"]
-            if new_card.winfo_exists():
-                new_card.configure(
-                    fg_color=interpolate_hex_color(THEME["bg_card"], THEME["accent_hover"], t)
-                )
+            new_col = interpolate_hex_color(THEME["bg_card"], THEME["accent_hover"], t)
+            self._set_game_card_bg(new_appid, new_col)
 
         if prev_appid and prev_appid != new_appid and prev_appid in self.game_tab_widgets:
-            old_card = self.game_tab_widgets[prev_appid]["card"]
-            if old_card.winfo_exists():
-                old_card.configure(
-                    fg_color=interpolate_hex_color(THEME["accent_hover"], THEME["bg_card"], t)
-                )
+            old_col = interpolate_hex_color(THEME["accent_hover"], THEME["bg_card"], t)
+            self._set_game_card_bg(prev_appid, old_col)
 
         header_bg = interpolate_hex_color("#2e2252", THEME["bg_card"], t)
         border_col = interpolate_hex_color("#c084fc", THEME["accent"], t)
@@ -3985,13 +4125,11 @@ class NebulaModManagerApp(BaseWindowClass):
         ModSitesDialog(self, self.selected_game)
 
     def _open_rottr_loader_gui_click(self):
-        """Pre-configures Rise of the Tomb Raider's path & registry before opening RottrModManager.exe."""
         if not self.selected_game:
             return
         game_root = Path(self.selected_game["install_dir"])
         appid = str(self.selected_game["appid"])
 
-        # Ensure Registry + Steam Junction are set so RottrModManager never shows the path error!
         ModLoaderAutoInstaller.configure_rottr_game_path(game_root, appid)
 
         exe = ModLoaderAutoInstaller.get_rottr_manager_exe(game_root)
@@ -4417,7 +4555,6 @@ class NebulaModManagerApp(BaseWindowClass):
             row.grid(row=idx, column=0, sticky="ew", pady=5, padx=4)
             row.grid_columnconfigure(0, weight=1)
 
-            # Show clean, simple mod name
             display_name = (
                 mod["name"]
                 if mod.get("custom_named")
@@ -4431,6 +4568,8 @@ class NebulaModManagerApp(BaseWindowClass):
                 text=f"{status_dot}   {display_name}{state_suffix}",
                 font=ctk.CTkFont(size=14, weight="bold"),
                 text_color=THEME["text_main"] if is_enabled else THEME["text_muted"],
+                fg_color=THEME["bg_sidebar"],
+                corner_radius=0,
                 anchor="w"
             ).grid(row=0, column=0, padx=14, pady=12, sticky="ew")
 
